@@ -335,24 +335,26 @@ def print_games_from_search_results(data, nosleep=False):
     games = {}
 
     for game in data.get("hits", []):
-        name = game.get("name", "Unknown")
-        original_price = game.get("default_retail", "N/A")
-        price = game.get("price_eur", "N/A")
-        discount = game.get("discount", "N/A")
-        discount_color = get_discount_class(discount)
-        price_color = get_price_class(price)
-        discount_price = f"{price.split('.')[0][:3]:>3},{price.split('.')[1][:2]:>2}" if price != "N/A" else "N/A"
-        original_price = f"{original_price.split('.')[0][:3]:>3},{original_price.split('.')[1][:2]:>2}" if original_price != "N/A" else "N/A"
-        if len(name[:GTL]) % 2 == 0:
-            name_str = f"{name[:GTL-2]:<{GTL}}".replace("  ", " .") + "  " # replace double spaces with dot for better visibility of spacing
-        else:
-            name_str = f"{name[:GTL-2]:<{GTL}}".replace("  ", ". ") + "  " # replace double spaces with dot for better visibility of spacing
+        try:
+            name = game.get("name", "Unknown")
+            original_price = game.get("default_retail", "N/A")
+            price = game.get("price_eur", "N/A")
+            discount = game.get("discount", "N/A")
+            discount_color = get_discount_class(discount)
+            price_color = get_price_class(price)
+            discount_price = f"{price.split('.')[0][:3]:>3},{price.split('.')[1][:2]:>2}" if price != "N/A" else "N/A"
+            original_price = f"{original_price.split('.')[0][:3]:>3},{original_price.split('.')[1][:2]:>2}" if original_price != "N/A" else "N/A"
+            if len(name[:GTL]) % 2 == 0:
+                name_str = f"{name[:GTL-2]:<{GTL}}".replace("  ", " .") + "  " # replace double spaces with dot for better visibility of spacing
+            else:
+                name_str = f"{name[:GTL-2]:<{GTL}}".replace("  ", ". ") + "  " # replace double spaces with dot for better visibility of spacing
 
-        games[name] = {
-            "original_price": original_price,
-            "price": discount_price,
-            "discount": discount
-        }
+            games[name] = {
+                "original_price": original_price,
+                "price": discount_price,
+                "discount": discount
+            }
+        except Exception: pass
 
         print(f"{discount_color}%\033[0m | {price_color}€\033[0m  {name_str} {original_price}{' '*6}{discount_price}   {discount:>4}%")
         if not nosleep: time.sleep(0.02)  # slight delay for better readability
@@ -794,7 +796,7 @@ if __name__ == "__main__":
         print(f"\n{'='*95}")
         print(f"     TOP GAMES BY DISCOUNT")
         print(f"{'='*95}")
-        for name, info in sorted_games[:100]:
+        for name, info in sorted_games[:500]:
             discount = info.get('discount', 'N/A')
             price = info.get('price', 'N/A')
             original_price = info.get('original_price', 'N/A')
