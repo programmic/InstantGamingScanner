@@ -12,8 +12,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from enum import Enum
 from InquirerPy import inquirer as ip
 
-print("\033c",end="")
-
 # enum list of status indicators for messages
 class Stat(Enum):
     INFO = 1
@@ -298,7 +296,7 @@ def init_fetcher() -> dict:
 # scrape instant-gaming.com for game prices and discounts
 
 
-def print_games_from_search_results(data):
+def print_games_from_search_results(data, nosleep=False):
     def get_discount_class(discount):
         try:
             d = int(discount)
@@ -357,6 +355,7 @@ def print_games_from_search_results(data):
         }
 
         print(f"{discount_color}%\033[0m | {price_color}€\033[0m  {name_str} {original_price}{' '*6}{discount_price}   {discount:>4}%")
+        if not nosleep: time.sleep(0.02)  # slight delay for better readability
 
     return games
 
@@ -430,14 +429,137 @@ def process_site(url: str, process_type: ProcessType, env: dict=None, base_direc
     return data
 
 
-def fetch_pages_with_playwright(env: dict, base_url: str, pages: int = 10) -> None:
-    """Fixed Playwright pagination with proper timeouts and wait strategies"""
+def detect_max_pages(env: dict, base_url: str, max_cap: int = 1000) -> int:
+    """Try multiple strategies to detect the maximum number of pages for a listing.
+
+    Strategies (in order):
+    - requests: parse anchors containing "page=" and look for rel="last"/aria-label="Last"
+    - playwright (if available): evaluate DOM to find page links
+    - fallback: return a safe cap
+    """
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+    }
+
+    try:
+        # Try lightweight requests first
+        r = requests.get(base_url, headers=headers, timeout=15)
+        text = r.text
+        # look for rel="last" href
+        m = re.search(r'<a[^>]+rel=["\']last["\'][^>]*href=["\']([^"\']+)["\']', text, re.IGNORECASE)
+        if m:
+            href = m.group(1)
+            mm = re.search(r'[?&]page=(\d+)', href)
+            if mm:
+                return int(mm.group(1))
+
+        # find all page=NN in hrefs and take max (ignore page=0)
+        nums = [int(n) for n in re.findall(r'[?&]page=(\d+)', text)]
+        nums = [n for n in nums if n > 0]
+        if nums:
+            return max(nums)
+
+        # also try path-based pagination like /trending/2/ or /trending/page/2
+        nums2 = [int(n) for n in re.findall(r'/page/(\d+)', text)] + [int(n) for n in re.findall(r'/trending/(\d+)/', text)]
+        nums2 = [n for n in nums2 if n > 0]
+        if nums2:
+            return max(nums2)
+
+        # aria-label or visible 'Last' text
+        m2 = re.search(r'<a[^>]+aria-label=["\']?Last["\']?[^>]*href=["\']([^"\']+)["\']', text, re.IGNORECASE)
+        if m2:
+            href = m2.group(1)
+            mm = re.search(r'[?&]page=(\d+)', href)
+            if mm:
+                return int(mm.group(1))
+    except Exception as e:
+        p(Stat.ERROR, f"Error occurred while detecting max pages: {e}")
+
+    # If Playwright is available, use it to read rendered DOM (helps with client-side pagination)
+    sync_playwright = env.get('sync_playwright') if env else None
+    if sync_playwright is not None:
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True)
+                context = browser.new_context()
+                page = context.new_page()
+                page.goto(base_url, wait_until='domcontentloaded', timeout=30000)
+                page.wait_for_timeout(1000)
+                # evaluate anchors and collect hrefs + visible numbers (helps path-based pagination)
+                hrefs = page.evaluate("() => Array.from(document.querySelectorAll('a')).map(a=>({href:a.href, text:a.textContent.trim()}))")
+                candidates = []
+                for entry in hrefs or []:
+                    h = entry.get('href') if isinstance(entry, dict) else entry
+                    t = entry.get('text') if isinstance(entry, dict) else ''
+                    mm = re.search(r'[?&]page=(\d+)', h or '')
+                    if mm:
+                        n = int(mm.group(1))
+                        if n > 0:
+                            candidates.append(n)
+                    # path based
+                    mm2 = re.search(r'/page/(\d+)', h or '') or re.search(r'/trending/(\d+)/', h or '')
+                    if mm2:
+                        n = int(mm2.group(1))
+                        if n > 0:
+                            candidates.append(n)
+                    # also consider numeric link text (visible page numbers)
+                    if t and re.fullmatch(r'\d+', t):
+                        n = int(t)
+                        if n > 0:
+                            candidates.append(n)
+                if candidates:
+                    browser.close()
+                    return max(candidates)
+
+                # try to find an element labelled 'Last' and extract its href
+                js_last = "() => { const a = Array.from(document.querySelectorAll('a')).find(x=>/last/i.test(x.getAttribute('aria-label')||x.textContent)); return a? a.href: null }"
+                last_href = page.evaluate(js_last)
+                if last_href:
+                    mm = re.search(r'[?&]page=(\d+)', last_href)
+                    if mm:
+                        browser.close()
+                        return int(mm.group(1))
+
+                # Try to detect total results like "Showing 1-25 of 5,500 results" and compute pages
+                try:
+                    txt = page.content()
+                    mtot = re.search(r'of\s+([\d,]+)\s+results', txt, re.IGNORECASE)
+                    if mtot:
+                        total = int(mtot.group(1).replace(',', ''))
+                        # try to infer per-page from number of item elements
+                        per = 25
+                        items = page.evaluate("() => document.querySelectorAll('.product, .product-item, .search-result-item, .game-item').length")
+                        try:
+                            if isinstance(items, int) and items > 0:
+                                per = int(items)
+                        except Exception:
+                            pass
+                        browser.close()
+                        return (total + per - 1) // per
+                except Exception as e:
+                    p(Stat.ERROR, f"Error detecting total results for page count estimation: {e}")
+
+                browser.close()
+        except Exception as e:
+            p(Stat.ERROR, f"Error occurred while using Playwright: {e}")
+
+    # fallback: return a reasonable cap so caller can proceed (caller may choose to iterate further)
+    return min(max_cap, 500)
+
+
+def fetch_pages_with_playwright(env: dict, base_url: str, pages: int = 10) -> dict:
+    """Fixed Playwright pagination with proper timeouts, deduplication, and return value"""
     sync_playwright = env.get('sync_playwright')
     if sync_playwright is None:
         p(Stat.ERROR, "Playwright not available in env")
-        return
+        return {}
 
     p(Stat.INFO, f"Using REAL URL pagination from: {base_url}")
+    
+    # Initialize games dict and seen_games set
+    all_games = {}
+    seen_games = set()
     
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
@@ -458,32 +580,21 @@ def fetch_pages_with_playwright(env: dict, base_url: str, pages: int = 10) -> No
             }
         )
         
-        seen_games = set()
-        
         for i in range(1, pages + 1):
             page = context.new_page()
-            p(Stat.INFO, f"Loading page {i} via direct URL navigation")
+            p(Stat.INFO, f"Loading page {i}/{pages}")
             
             url = f"{base_url}?page={i}"
             
             try:
-                # Use 'domcontentloaded' + explicit timeout instead of networkidle
+                # Navigate with timeout
                 page.goto(url, wait_until='domcontentloaded', timeout=45000)
-                
-                # Wait for the main content container OR searchResults
-                selectors_to_wait = [
-                    '[data-search-results]', 
-                    '.search-results',
-                    '.products-list',
-                    'window.searchResults'
-                ]
-                
-                page.wait_for_timeout(2000)  # Give JS time to execute
+                page.wait_for_timeout(3000)  # Give JS time to execute
                 
                 # Try multiple strategies to detect loaded content
                 data_found = False
                 try:
-                    # Strategy 1: Wait for searchResults in window
+                    # Strategy 1: Wait for searchResults with hits
                     page.wait_for_function(
                         "() => !!(window.searchResults && window.searchResults.hits && window.searchResults.hits.length > 0)", 
                         timeout=10000
@@ -495,7 +606,7 @@ def fetch_pages_with_playwright(env: dict, base_url: str, pages: int = 10) -> No
                 
                 if not data_found:
                     try:
-                        # Strategy 2: Wait for product list elements
+                        # Strategy 2: Wait for product elements
                         page.wait_for_selector('.product-item, .game-item, [data-product], .search-result-item', timeout=5000)
                         p(Stat.SUCCESS, f"Found product elements on page {i}")
                         data_found = True
@@ -503,100 +614,136 @@ def fetch_pages_with_playwright(env: dict, base_url: str, pages: int = 10) -> No
                         pass
                 
                 if not data_found:
-                    p(Stat.WARNING, f"No clear content markers on page {i}, using fallback")
+                    p(Stat.WARNING, f"No clear content markers on page {i}, trying extraction anyway")
                 
                 # Extract data with multiple fallback methods
                 js_data = None
                 try:
                     js_data = page.evaluate('() => window.searchResults')
-                    if js_data and isinstance(js_data, dict) and js_data.get('hits'):
-                        hits = js_data['hits']
-                        new_games = [game.get('name', f'Game_{i}') for game in hits]
-                        new_count = len([g for g in new_games if g not in seen_games])
-                        
-                        if new_count > 0:
-                            p(Stat.SUCCESS, f"Page {i}: {len(hits)} total, {new_count} new games")
-                            print(f"\n{'='*90}")
-                            print(f"     PAGE {i} - TOP DEALS ({new_count} NEW)")
-                            print(f"{'='*90}")
-                            print_games_from_search_results(js_data)
-                            seen_games.update(new_games)
-                        else:
-                            p(Stat.WARNING, f"Page {i}: No new games (all duplicates)")
-                    else:
-                        p(Stat.WARNING, f"Page {i}: Empty or invalid searchResults")
                 except Exception as e:
-                    p(Stat.WARNING, f"Page {i} JS extraction failed: {e}")
+                    p(Stat.WARNING, f"Page {i} JS evaluation failed: {e}")
                 
-                # Debug screenshot
-                try:
-                    page.screenshot(path=f'debug_page_{i}.png')
-                except:
-                    pass
+                if js_data and isinstance(js_data, dict) and js_data.get('hits'):
+                    hits = js_data['hits']
+                    new_count = 0
                     
+                    # Process each game and deduplicate
+                    for game in hits:
+                        name = game.get('name', f'Unknown_{i}')
+                        
+                        # Skip if already seen
+                        if name in seen_games:
+                            continue
+                        
+                        seen_games.add(name)
+                        
+                        # Use correct field names from your print_games_from_search_results function
+                        all_games[name] = {
+                            "original_price": game.get("default_retail", "N/A"),
+                            "price": game.get("price_eur", "N/A"),
+                            "discount": game.get("discount", "N/A")
+                        }
+                        new_count += 1
+                    
+                    if new_count > 0:
+                        p(Stat.SUCCESS, f"Page {i}: {len(hits)} total, {new_count} NEW games")
+                        print(f"\n{'='*95}")
+                        print(f"     PAGE {i} - TOP DEALS ({new_count} NEW GAMES)")
+                        print(f"{'='*95}")
+                        print_games_from_search_results(js_data)
+                    else:
+                        p(Stat.WARNING, f"Page {i}: No new games (all duplicates)")
+                else:
+                    p(Stat.WARNING, f"Page {i}: Empty or invalid searchResults")
+                
+                # Debug screenshot every 3rd page
+                if i % 3 == 0:
+                    try:
+                        page.screenshot(path=f'debug_page_{i}.png')
+                        p(Stat.INFO, f"Saved debug screenshot: debug_page_{i}.png")
+                    except:
+                        pass
+                        
             except Exception as e:
                 p(Stat.ERROR, f"Page {i} navigation failed: {e}")
             
             page.close()
             
-            # Early exit conditions
+            # Rate limiting and early exit
             if i > 2 and len(seen_games) == 0:
-                p(Stat.INFO, "No content found in first few pages, stopping")
+                p(Stat.INFO, "No content found in first few pages, stopping early")
                 break
-            if i > 1 and (i % 3 == 0):  # Pause every 3 pages
-                p(Stat.INFO, "Short pause to avoid rate limiting...")
-                time.sleep(1)
+            if i % 3 == 0:
+                p(Stat.INFO, "⏸ Rate limiting pause...")
+                time.sleep(1.5)
         
         browser.close()
-
-# Replace the main execution block:
-if __name__ == "__main__":
-    env = init_fetcher()
     
-    if env.get('sync_playwright') is not None:
-        p(Stat.INFO, "Using Playwright with FIXED pagination")
-        base_no_param = "https://www.instant-gaming.com/en/pc/steam/trending/"
-        fetch_pages_with_playwright(env, base_no_param, pages=10)
-    else:
-        p(Stat.WARNING, "Playwright not available, install with: playwright install chromium")
-BASE_URL: str = "https://www.instant-gaming.com/en/pc/steam/trending/?page="
+    p(Stat.SUCCESS, f"Playwright complete! Total unique games: {len(all_games)}")
+    return all_games
+
+# # Replace the main execution block:
+# if __name__ == "__main__":
+#     env = init_fetcher()
+#     
+#     if env.get('sync_playwright') is not None:
+#         p(Stat.INFO, "Using Playwright with FIXED pagination")
+#         base_no_param = "https://www.instant-gaming.com/en/pc/steam/trending/"
+#         fetch_pages_with_playwright(env, base_no_param, pages=10)
+#     else:
+#         p(Stat.WARNING, "Playwright not available, install with: playwright install chromium")
+#BASE_URL: str = "https://www.instant-gaming.com/en/pc/steam/trending/?page="
 BASE_DIRECTORY: str = os.getcwd() + "/tmp_html"  # current working directory for saving HTML files
+BASE_URL = "https://www.instant-gaming.com/en/pc/steam/trending/"
 
 if __name__ == "__main__":
     print("\033c", end="")
+    p(Stat.INFO, "Starting Instant Gaming Scraper...")
     env = init_fetcher()
 
     # get max amount of pages to scrape from user input (default 10) using inquirerPy, with validation and error handling
     try:
-        pages = ip.text("How many pages to scrape?", default="10", validate=lambda x: x.isdigit() and int(x) > 0, invalid_message="Please enter a positive integer").execute()
-        pages = int(pages)
+        page_count = ip.text("How many pages to scrape?", default="10", validate=lambda x: x.isdigit(), invalid_message="Please enter a integer").execute()
+        page_count = int(page_count)
     except Exception as e:
         p(Stat.ERROR, f"Input error: {e}. Defaulting to 10 pages.")
-        pages = 10
+        page_count = 10
 
-    if pages > 20:
-        if not ip.confirm(f"You entered {pages} pages. This may take a long time and could trigger anti-bot measures. Are you sure?", default=False).execute():
+    if page_count > 20:
+        if not ip.confirm(f"You entered {page_count} pages. This may take a long time and could trigger anti-bot measures. Are you sure?", default=False).execute():
             p(Stat.INFO, "Aborting per user request.")
             exit(0)
-    elif pages < 1:
-        if ip.confirm(f"You entered {pages} pages. Selection of 0 or less pages leads to all pages being scraped, which may take a very long time.\nAre you sure you want to proceed scraping ALL pages?", default=False).execute():
+    elif page_count < 1:
+        if ip.confirm(f"You entered {page_count} pages. Selection of 0 or less pages leads to all pages being scraped, which may take a very long time.\nAre you sure you want to proceed scraping ALL pages?", default=False).execute():
             p(Stat.INFO, "Proceeding to scrape all pages. This may take a very long time and could trigger anti-bot measures.")
-            # detect max ammount of pages 
+            # detect max amount of pages automatically
+            try:
+                detected = detect_max_pages(env, BASE_URL)
+                if detected and isinstance(detected, int) and detected > 0:
+                    page_count = detected
+                    p(Stat.SUCCESS, f"Detected maximum pages: {page_count}")
+                    if page_count > 500:
+                        p(Stat.WARNING, f"Detected a very large page count ({page_count}). You may prefer to limit this to avoid rate limiting.")
+                else:
+                    p(Stat.WARNING, "Could not detect max pages, defaulting to 10 pages.")
+                    page_count = 10
+            except Exception as e:
+                p(Stat.WARNING, f"Auto-detection failed: {e}. Defaulting to 10 pages.")
+                page_count = 10
         
-
+    p(Stat.INFO, f"Will scrape {page_count} pages of results from Instant Gaming.")
     
-    BASE_URL = "https://www.instant-gaming.com/en/pc/steam/trending/"
     
     if env.get('sync_playwright') is not None:
-        p(Stat.INFO, "Using Playwright with FIXED pagination - scraping 10 pages")
-        fetch_pages_with_playwright(env, BASE_URL, pages=10)
+        p(Stat.INFO, f"Using Playwright with FIXED pagination - scraping {page_count} pages")
+        all_games = fetch_pages_with_playwright(env, BASE_URL, pages=page_count)
     else:
         p(Stat.WARNING, "Playwright not available. Install with: pip install playwright && playwright install chromium")
         p(Stat.INFO, "Falling back to Selenium...")
         
         all_games = {}
-        for i in range(1, 11):
-            p(Stat.INFO, f"Processing page {i}/10 with Selenium")
+        for i in range(1, page_count + 1):
+            p(Stat.INFO, f"Processing page {i}/{page_count} with Selenium")
             url = f"{BASE_URL}?page={i}"
             data = get_search_results_with_selenium(url, env=env)
             
@@ -624,12 +771,31 @@ if __name__ == "__main__":
     
     response = ip.confirm("Print out top games sorted by discount?", default=True).execute()
     if response:
-        sorted_games = sorted(all_games.items(), key=lambda x: x[1].get('discount', 0), reverse=True)
+        def safe_discount_value(item):
+            # item is a tuple (name, info_dict) or info_dict depending on caller
+            info = item[1] if isinstance(item, tuple) else item
+            d = info.get('discount', 0)
+            try:
+                if d is None:
+                    return 0
+                if isinstance(d, (int, float)):
+                    return int(d)
+                s = str(d).strip()
+                if s.lower() in ('n/a', ''):
+                    return 0
+                if s.endswith('%'):
+                    s = s[:-1]
+                s = s.replace(',', '.')
+                return int(float(s))
+            except Exception:
+                return 0
+
+        sorted_games = sorted(all_games.items(), key=safe_discount_value, reverse=True)
         print(f"\n{'='*95}")
         print(f"     TOP GAMES BY DISCOUNT")
         print(f"{'='*95}")
-        for name, info in sorted_games[:20]:
+        for name, info in sorted_games[:100]:
             discount = info.get('discount', 'N/A')
             price = info.get('price', 'N/A')
             original_price = info.get('original_price', 'N/A')
-            print(f"{name} - {discount}% off - Now €{price} (was €{original_price})")
+            print(f"{name[:48]:<50} - {discount:>6}% off -  {price:>6}€   ( {original_price:>6}€ )")
