@@ -1,3 +1,5 @@
+import sys
+
 from selenium.webdriver.chrome.service import Service
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -11,6 +13,7 @@ import subprocess
 from selenium.webdriver.support.ui import WebDriverWait
 from enum import Enum
 from InquirerPy import inquirer as ip
+import re
 
 # enum list of status indicators for messages
 class Stat(Enum):
@@ -28,6 +31,43 @@ def p(status: Stat, message: str) -> None:
         print(f"\033[33m[!]\033[0m {message}")
     elif status == Stat.ERROR:
         print(f"\033[31m[#]\033[0m {message}")
+
+
+def visible_length(s: str) -> int:
+    ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
+    return len(ANSI_ESCAPE.sub('', s))
+
+def get_discount_class(discount):
+    try:
+        d = int(discount)
+        if d >= 90:
+            return "\033[35m"  
+        elif d >= 75:
+            return "\033[32m"
+        elif d >= 60:
+            return "\033[33m"
+        elif d > 45:
+            return "\033[31m"
+        else:
+            return "\033[90m"
+    except Exception:
+        return "\033[0m"
+    
+def get_price_class(price):
+    try:
+        p = float(price)
+        if p == 0:
+            return "\033[95m"  
+        elif p <= 1:
+            return "\033[35m"
+        elif p <= 5:
+            return "\033[32m"
+        elif p <= 10:
+            return "\033[33m"
+        else:
+            return "\033[90m"
+    except Exception:
+        return "\033[0m"
 
 
 def get_search_results_with_selenium(url, env=None):
@@ -297,35 +337,7 @@ def init_fetcher() -> dict:
 
 
 def print_games_from_search_results(data, nosleep=False):
-    def get_discount_class(discount):
-        try:
-            d = int(discount)
-            if d >= 90:
-                return "\033[35m"  
-            elif d >= 75:
-                return "\033[32m"
-            elif d >= 60:
-                return "\033[33m"
-            elif d > 45:
-                return "\033[31m"
-            else:
-                return "\033[90m"
-        except Exception:
-            return "\033[0m"
     
-    def get_price_class(price):
-        try:
-            p = float(price)
-            if p == 0:
-                return "\033[36m"  
-            elif p < 5:
-                return "\033[32m"
-            elif p < 10:
-                return "\033[33m"
-            else:
-                return "\033[90m"
-        except Exception:
-            return "\033[0m"
     
     GTL: int = 45 # Game title length
 
@@ -661,8 +673,8 @@ def fetch_pages_with_playwright(env: dict, base_url: str, pages: int = 10) -> di
                 # Debug screenshot every 3rd page
                 if i % 3 == 0:
                     try:
-                        page.screenshot(path=f'debug_page_{i}.png')
-                        p(Stat.INFO, f"Saved debug screenshot: debug_page_{i}.png")
+                        page.screenshot(path=f'debug_screenshots/debug_page_{i}.png')
+                        p(Stat.INFO, f"Saved debug screenshot: debug_screenshots/debug_page_{i}.png")
                     except:
                         pass
                         
@@ -684,95 +696,243 @@ def fetch_pages_with_playwright(env: dict, base_url: str, pages: int = 10) -> di
     p(Stat.SUCCESS, f"Playwright complete! Total unique games: {len(all_games)}")
     return all_games
 
-# # Replace the main execution block:
-# if __name__ == "__main__":
-#     env = init_fetcher()
-#     
-#     if env.get('sync_playwright') is not None:
-#         p(Stat.INFO, "Using Playwright with FIXED pagination")
-#         base_no_param = "https://www.instant-gaming.com/en/pc/steam/trending/"
-#         fetch_pages_with_playwright(env, base_no_param, pages=10)
-#     else:
-#         p(Stat.WARNING, "Playwright not available, install with: playwright install chromium")
-#BASE_URL: str = "https://www.instant-gaming.com/en/pc/steam/trending/?page="
+def compare_with_wishlist(p_all_games: dict, wishlist_input: str = None) -> dict:
+    if wishlist_input is not None:
+        wishlist_items = wishlist_input.split(",")
+    else:
+        with open('wishlist.txt', 'r', encoding='utf-8') as f:
+            wishlist_items = f.read().split(",")
+    print("Wishlist Items detected:", len(wishlist_items))
+
+    wishlist_corrected = []
+    for game_name in wishlist_items:
+        game_name_corrected = ""
+        for letter in game_name:
+            if letter in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:!?.- ":
+                game_name_corrected += letter
+        wishlist_corrected.append(game_name_corrected)
+
+    if wishlist_corrected:
+        print(f"\n{'='*95}")
+        print(f"     YOUR WISHLIST ITEMS")
+        print(f"{'='*95}")
+
+        unfound_games = []
+        database_normalized = {}
+
+        final_data = {} # stores matched wishlist items with their price/discount info for potential future use (e.g. saving to file, further analysis, etc.)
+
+        for name, info in p_all_games.items():
+            normalized_name = ""
+            for letter in name:
+                if letter in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:!?.- ":
+                    normalized_name += letter
+            database_normalized[normalized_name] = info
+
+        for item in wishlist_corrected:
+            info = database_normalized.get(item.strip())
+            if not info:
+                unfound_games.append(item.strip())
+                continue
+
+            discount = info.get('discount', 'N/A')
+            price = info.get('price', 'N/A')
+            original_price = info.get('original_price', 'N/A')
+            orig_str = f"{original_price:>6}" if original_price is not None else "\033[90m  N/A \033[0m"
+            # print(f"{str(item)[:48]:<50} - {str(discount):>6}% off -  {str(price):>6}€   ( {orig_str}€ )")
+            final_data[item] = {'discount': discount, 'price': price, 'original_price': original_price.strip() if isinstance(original_price, str) else original_price}
+        p(Stat.INFO, f"Wishlist comparison complete! {len(wishlist_corrected) - len(unfound_games)} items found, {len(unfound_games)} items not found.")
+        
+        # print final_data sorted by discount
+        sorted_final = sorted(final_data.items(), key=lambda x: x[1]['discount'], reverse=True)
+        for idx, x in enumerate(sorted_final):
+            item = x[0]
+            info = x[1]
+            discount = info.get('discount', 'N/A')
+            price = info.get('price', 'N/A')
+            original_price = info.get('original_price', 'N/A')
+            orig_str = f"{original_price:>5}" if original_price is not None else "\033[90m N/A \033[0m"
+            
+            # add seperative lines between discount levels for better readability
+            if idx > 0 and isinstance(discount, (int, float)) and isinstance(sorted_final[idx-1][1]['discount'], (int, float)):
+                prev_discount = sorted_final[idx-1][1]['discount']
+                # Print separator when crossing into a lower tier (descending order)
+                if   prev_discount >= 100 and discount < 100: print(f"{' '*48}100 - 90\n{'='*95}")
+                elif prev_discount >= 90 and discount < 90: print(f"{' '*48}90 - 75\n{'='*95}")
+                elif prev_discount >= 75 and discount < 75: print(f"{' '*48}75 - 60\n{'='*95}")
+                elif prev_discount >= 60 and discount < 60: print(f"{' '*48}60 - 45\n{'='*95}")
+                elif prev_discount >= 45 and discount < 45: print(f"{' '*48}45 - 20\n{'='*95}")
+                elif prev_discount >= 20 and discount < 20: print(f"{' '*48}20 - 0\n{'='*95}")
+
+            price_str = f"{price:>5}€" if str(price) != "1.00" else "\033[95m 1.00€\033[0m"
+
+            print(f"{str(item)[:48]:<50} - {str(discount):>6}% off -  {price_str}   ( {orig_str}€ )   {get_price_class(price)}€\033[0;0m") # add color based on discount level
+
+
+        if unfound_games:
+            print(f"\n{'='*95}")
+            print(f"     UNFOUND WISHLIST ITEMS")
+            print(f"{'='*95}")
+            for item in unfound_games:
+                print(item)
+        print_price_classes()
+    else:
+        p(Stat.INFO, "No wishlist items selected.")
+    
+
+def print_price_classes():
+    repres: str = f"\033[95m[ 0€ ]\033[0m  -  \033[35m[ 1€ ]\033[0m  -  \033[31m[ 5€ ]\033[0m  -  \033[33m[ 15€ ]\033[0m  -  \033[32m[ 15€+ ]\033[0m"
+    title = " -= Price Classes =- "
+
+    spacing = int(visible_length(repres) / 2 - len(title) / 2)
+
+    print(f"\n{' ' * spacing}{title}")
+    print(repres)
+
+
 BASE_DIRECTORY: str = os.getcwd() + "/tmp_html"  # current working directory for saving HTML files
 BASE_URL = "https://www.instant-gaming.com/en/pc/steam/trending/"
 
 if __name__ == "__main__":
-    print("\033c", end="")
-    p(Stat.INFO, "Starting Instant Gaming Scraper...")
-    env = init_fetcher()
 
-    # get max amount of pages to scrape from user input (default 10) using inquirerPy, with validation and error handling
-    try:
-        page_count = ip.text("How many pages to scrape?", default="10", validate=lambda x: x.isdigit(), invalid_message="Please enter a integer").execute()
-        page_count = int(page_count)
-    except Exception as e:
-        p(Stat.ERROR, f"Input error: {e}. Defaulting to 10 pages.")
-        page_count = 10
+    # detect console arguments for quick settings
+    compare_with_wishlist_B = None
+    page_count = None
+    print_games = False
+    save_json = False
+    load_data_from_json = False
 
-    if page_count > 20:
-        if not ip.confirm(f"You entered {page_count} pages. This may take a long time and could trigger anti-bot measures. Are you sure?", default=False).execute():
-            p(Stat.INFO, "Aborting per user request.")
+    input_wishlist_terminal = False
+
+    if len(sys.argv) > 1:
+        if "--help" in sys.argv or "-h" in sys.argv:
+            print("Usage: python main.py [options]\n")
+            print("Options:")
+            print("  --wishlist       Compare scraped games with wishlist.txt")
+            print("  --all            Scrape all pages (default is to ask for page count)")
+            print("  --print          Print scraped games to console (default)")
+            print("  --no-print       Do not print scraped games to console")
+            print("  --save           Save scraped data to games.json")
+            print("  --load           Load scraped data from games.json instead of scraping")
             exit(0)
-    elif page_count < 1:
-        if ip.confirm(f"You entered {page_count} pages. Selection of 0 or less pages leads to all pages being scraped, which may take a very long time.\nAre you sure you want to proceed scraping ALL pages?", default=False).execute():
-            p(Stat.INFO, "Proceeding to scrape all pages. This may take a very long time and could trigger anti-bot measures.")
-            # detect max amount of pages automatically
-            try:
-                detected = detect_max_pages(env, BASE_URL)
-                if detected and isinstance(detected, int) and detected > 0:
-                    page_count = detected
-                    p(Stat.SUCCESS, f"Detected maximum pages: {page_count}")
-                    if page_count > 500:
-                        p(Stat.WARNING, f"Detected a very large page count ({page_count}). You may prefer to limit this to avoid rate limiting.")
-                else:
-                    p(Stat.WARNING, "Could not detect max pages, defaulting to 10 pages.")
-                    page_count = 10
-            except Exception as e:
-                p(Stat.WARNING, f"Auto-detection failed: {e}. Defaulting to 10 pages.")
-                page_count = 10
-        
-    p(Stat.INFO, f"Will scrape {page_count} pages of results from Instant Gaming.")
-    
-    
-    if env.get('sync_playwright') is not None:
-        p(Stat.INFO, f"Using Playwright with FIXED pagination - scraping {page_count} pages")
-        all_games = fetch_pages_with_playwright(env, BASE_URL, pages=page_count)
-    else:
-        p(Stat.WARNING, "Playwright not available. Install with: pip install playwright && playwright install chromium")
-        p(Stat.INFO, "Falling back to Selenium...")
-        
-        all_games = {}
-        for i in range(1, page_count + 1):
-            p(Stat.INFO, f"Processing page {i}/{page_count} with Selenium")
-            url = f"{BASE_URL}?page={i}"
-            data = get_search_results_with_selenium(url, env=env)
-            
-            if data and data.get('hits'):
-                p(Stat.SUCCESS, f"Page {i}: {len(data['hits'])} games")
-                print(f"\n{'='*95}")
-                print(f"     PAGE {i} - TOP DEALS ({len(data['hits'])} GAMES)")
-                print(f"{'='*95}")
-                games = print_games_from_search_results(data)
-                all_games.update(games)
-            else:
-                p(Stat.WARNING, f"Page {i} failed/empty - stopping")
-                break
-        
-        p(Stat.SUCCESS, f"COMPLETE! Scraped {len(all_games)} unique games across {len(set([v['discount'] for v in all_games.values()]))} discount levels")
 
-    
-    try:
-        if ip.confirm("Save results to games.json?", default=True).execute():
-            with open('games.json', 'w', encoding='utf-8') as f:
-                json.dump(all_games, f, indent=4)
-            p(Stat.SUCCESS, "Saved games.json successfully!")
-    except Exception as e:
-        p(Stat.ERROR, f"Input prompt failed: {e}")
-    
-    response = ip.confirm("Print out top games sorted by discount?", default=True).execute()
-    if response:
+        if "--wishlist" in sys.argv or "-w" in sys.argv:
+            compare_with_wishlist_B = True
+            if "--wishlist-terminal" in sys.argv or "-wt" in sys.argv:
+                input_wishlist_terminal = True
+
+        elif "--no-wishlist" in sys.argv or "-nw" in sys.argv:
+            compare_with_wishlist_B = False
+        
+        if "--all" in sys.argv:
+            page_count = 0
+
+        if "--print" in sys.argv or "-p" in sys.argv:
+            print_games = True
+        elif "--no-print" in sys.argv or "-np" in sys.argv:
+            print_games = False
+
+        if "--save" in sys.argv:
+            save_json = True
+        
+        if "--load" in sys.argv or "-l" in sys.argv:
+            load_data_from_json = True
+
+
+    if not load_data_from_json:
+        print("\033c", end="")
+        p(Stat.INFO, "Starting Instant Gaming Scraper...")
+        env = init_fetcher()
+
+        # get max amount of pages to scrape from user input (default 10) using inquirerPy, with validation and error handling
+        if page_count is None:
+            try:
+                page_count = ip.text("How many pages to scrape?", default="10", validate=lambda x: x.isdigit(), invalid_message="Please enter a integer").execute()
+                page_count = int(page_count)
+            except Exception as e:
+                p(Stat.ERROR, f"Input error: {e}. Defaulting to 10 pages.")
+                page_count = 10
+
+        if page_count > 20:
+            if not ip.confirm(f"You entered {page_count} pages. This may take a long time and could trigger anti-bot measures. Are you sure?", default=False).execute():
+                p(Stat.INFO, "Aborting per user request.")
+                exit(0)
+        elif page_count < 1:
+            if ip.confirm(f"You entered {page_count} pages. Selection of 0 or less pages leads to all pages being scraped, which may take a very long time.\nAre you sure you want to proceed scraping ALL pages?", default=False).execute():
+                p(Stat.INFO, "Proceeding to scrape all pages. This may take a very long time and could trigger anti-bot measures.")
+                # detect max amount of pages automatically
+                try:
+                    detected = detect_max_pages(env, BASE_URL)
+                    if detected and isinstance(detected, int) and detected > 0:
+                        page_count = detected
+                        p(Stat.SUCCESS, f"Detected maximum pages: {page_count}")
+                        if page_count > 500:
+                            p(Stat.WARNING, f"Detected a very large page count ({page_count}). You may prefer to limit this to avoid rate limiting.")
+                    else:
+                        p(Stat.WARNING, "Could not detect max pages, defaulting to 10 pages.")
+                        page_count = 10
+                except Exception as e:
+                    p(Stat.WARNING, f"Auto-detection failed: {e}. Defaulting to 10 pages.")
+                    page_count = 10
+            
+        p(Stat.INFO, f"Will scrape {page_count} pages of results from Instant Gaming.")
+        
+        
+        if env.get('sync_playwright') is not None:
+            p(Stat.INFO, f"Using Playwright with FIXED pagination - scraping {page_count} pages")
+            all_games = fetch_pages_with_playwright(env, BASE_URL, pages=page_count)
+        else:
+            p(Stat.WARNING, "Playwright not available. Install with: pip install playwright && playwright install chromium")
+            p(Stat.INFO, "Falling back to Selenium...")
+            
+            all_games = {}
+            for i in range(1, page_count + 1):
+                p(Stat.INFO, f"Processing page {i}/{page_count} with Selenium")
+                url = f"{BASE_URL}?page={i}"
+                data = get_search_results_with_selenium(url, env=env)
+                
+                if data and data.get('hits'):
+                    p(Stat.SUCCESS, f"Page {i}: {len(data['hits'])} games")
+                    print(f"\n{'='*95}")
+                    print(f"     PAGE {i} - TOP DEALS ({len(data['hits'])} GAMES)")
+                    print(f"{'='*95}")
+                    games = print_games_from_search_results(data)
+                    all_games.update(games)
+                else:
+                    p(Stat.WARNING, f"Page {i} failed/empty - stopping")
+                    break
+            
+            p(Stat.SUCCESS, f"COMPLETE! Scraped {len(all_games)} unique games across {len(set([v['discount'] for v in all_games.values()]))} discount levels")
+
+        if save_json:
+            try:
+                if ip.confirm("Save results to games.json?", default=True).execute():
+                    with open('games.json', 'w', encoding='utf-8') as f:
+                        json.dump(all_games, f, indent=4)
+                    p(Stat.SUCCESS, "Saved games.json successfully!")
+            except Exception as e:
+                p(Stat.ERROR, f"Input prompt failed: {e}")
+    else:
+        try:
+            with open('games.json', 'r', encoding='utf-8') as f:
+                all_games = json.load(f)
+            p(Stat.SUCCESS, f"Loaded {len(all_games)} games from games.json")
+        except Exception as e:
+            p(Stat.ERROR, f"Failed to load games.json: {e}")
+            all_games = {}
+
+    cnt = False
+    if print_games:
+        cnt = True
+    elif print_games == False:
+        cnt = False
+    elif print_games is None:
+        response = ip.confirm("Print out top games sorted by discount?", default=True).execute()
+        cnt = response
+    else: raise ValueError("Invalid value for print_games")
+
+
+    if cnt:
         def safe_discount_value(item):
             # item is a tuple (name, info_dict) or info_dict depending on caller
             info = item[1] if isinstance(item, tuple) else item
@@ -801,3 +961,21 @@ if __name__ == "__main__":
             price = info.get('price', 'N/A')
             original_price = info.get('original_price', 'N/A')
             print(f"{name[:48]:<50} - {discount:>6}% off -  {price:>6}€   ( {original_price:>6}€ )")
+        
+    cnt = False
+    if compare_with_wishlist_B:
+        cnt = True
+    elif compare_with_wishlist_B is None:
+        cnt = ip.confirm("Do you want to compare with your wishlist items?").execute()
+    else: p(Stat.INFO, "Skipping wishlist comparison per user settings.")
+        
+    if cnt:
+        if input_wishlist_terminal:
+            try:
+                wishlist_input = ip.text("Enter your wishlist items separated by commas:").execute()
+                with open('wishlist.txt', 'w', encoding='utf-8') as f:
+                    f.write(wishlist_input)
+                p(Stat.SUCCESS, "Wishlist saved to wishlist.txt")
+            except Exception as e:
+                p(Stat.ERROR, f"Input error: {e}. Cannot proceed with wishlist comparison.")
+        compare_with_wishlist(all_games, wishlist_input if input_wishlist_terminal else None)
