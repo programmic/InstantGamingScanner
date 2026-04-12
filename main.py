@@ -15,6 +15,13 @@ from enum import Enum
 from InquirerPy import inquirer as ip
 import re
 
+
+global BASE_URL, BASE_URL_NON_STEAM, BASE_DIRECTORY
+BASE_DIRECTORY: str = os.getcwd() + "/tmp_html"  # current working directory for saving HTML files
+BASE_URL = "https://www.instant-gaming.com/en/pc/steam/trending/"
+BASE_URL_NON_STEAM = "https://www.instant-gaming.com/en/pc/games/trending/"
+
+
 # enum list of status indicators for messages
 class Stat(Enum):
     INFO = 1
@@ -31,7 +38,6 @@ def p(status: Stat, message: str) -> None:
         print(f"\033[33m[!]\033[0m {message}")
     elif status == Stat.ERROR:
         print(f"\033[31m[#]\033[0m {message}")
-
 
 def visible_length(s: str) -> int:
     ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
@@ -68,7 +74,6 @@ def get_price_class(price):
             return "\033[90m"
     except Exception:
         return "\033[0m"
-
 
 def get_search_results_with_selenium(url, env=None):
     p(Stat.INFO, f"Starting renderer to fetch data from: {url}")
@@ -291,7 +296,6 @@ def get_search_results_with_selenium(url, env=None):
     return data
 # (moved imports to top)
 
-
 def init_fetcher() -> dict:
     """Detect available backends and binary paths once at startup.
     Returns an env dict used by get_search_results_with_selenium to avoid repeated checks.
@@ -334,7 +338,6 @@ def init_fetcher() -> dict:
     return env
 
 # scrape instant-gaming.com for game prices and discounts
-
 
 def print_games_from_search_results(data, nosleep=False):
     
@@ -441,7 +444,6 @@ def process_site(url: str, process_type: ProcessType, env: dict=None, base_direc
         p(Stat.INFO, f"Extracted data (start): {game_data_str[:200]}")
         return None
     return data
-
 
 def detect_max_pages(env: dict, base_url: str, max_cap: int = 1000) -> int:
     """Try multiple strategies to detect the maximum number of pages for a listing.
@@ -560,7 +562,6 @@ def detect_max_pages(env: dict, base_url: str, max_cap: int = 1000) -> int:
 
     # fallback: return a reasonable cap so caller can proceed (caller may choose to iterate further)
     return min(max_cap, 500)
-
 
 def fetch_pages_with_playwright(env: dict, base_url: str, pages: int = 10) -> dict:
     """Fixed Playwright pagination with proper timeouts, deduplication, and return value"""
@@ -778,7 +779,30 @@ def compare_with_wishlist(p_all_games: dict, wishlist_input: str = None) -> dict
         print_price_classes()
     else:
         p(Stat.INFO, "No wishlist items selected.")
+
+def compare_games_lists(games1: dict, games2: dict) -> dict:
+    """Compare two game dictionaries and return a dict of games that are in games1 but not in games2, along with their price/discount info from games1."""
+    unique_games = {}
+    for name, info in games1.items():
+        if name not in games2:
+            unique_games[name] = info
+    return unique_games
+
+def scrapce_con_steam(p_page_count, env, url=BASE_URL_NON_STEAM, save_to_file=True) -> dict:
+    non_steam_games = fetch_pages_with_playwright(env, url, pages=p_page_count)
+    # Save non-steam games to file for inspection
+    if save_to_file:
+        p(Stat.INFO, f"Fetched {len(non_steam_games)} non-steam games. Saving to file...")
+        try:
+            with open('non_steam_games.json', 'w', encoding='utf-8') as f:
+                json.dump(non_steam_games, f, indent=2)
+            p(Stat.INFO, "Saved non-steam games to non_steam_games.json for inspection.")
+        except Exception as e:
+            p(Stat.ERROR, f"Could not save non-steam games to file: {e}")
+    else:
+        p(Stat.INFO, f"Fetched {len(non_steam_games)} non-steam games.")
     
+    return non_steam_games
 
 def print_price_classes():
     repres: str = f"\033[95m[ 0€ ]\033[0m  -  \033[35m[ 1€ ]\033[0m  -  \033[31m[ 5€ ]\033[0m  -  \033[33m[ 15€ ]\033[0m  -  \033[32m[ 15€+ ]\033[0m"
@@ -789,9 +813,6 @@ def print_price_classes():
     print(f"\n{' ' * spacing}{title}")
     print(repres)
 
-
-BASE_DIRECTORY: str = os.getcwd() + "/tmp_html"  # current working directory for saving HTML files
-BASE_URL = "https://www.instant-gaming.com/en/pc/steam/trending/"
 
 if __name__ == "__main__":
 
@@ -817,25 +838,34 @@ if __name__ == "__main__":
             exit(0)
 
         if "--wishlist" in sys.argv or "-w" in sys.argv:
+            p(Stat.INFO, "[Found flag in arguemnts]: --wishlist / -w")
             compare_with_wishlist_B = True
             if "--wishlist-terminal" in sys.argv or "-wt" in sys.argv:
+                p(Stat.INFO, "[Found flag in arguments]: --wishlist-terminal / -wt")
                 input_wishlist_terminal = True
 
         elif "--no-wishlist" in sys.argv or "-nw" in sys.argv:
+            p(Stat.INFO, "[Found flag in arguments]: --no-wishlist / -nw")
             compare_with_wishlist_B = False
         
         if "--all" in sys.argv:
+            p(Stat.INFO, "[Found flag in arguments]: --all (scrape all pages)")
             page_count = 0
 
         if "--print" in sys.argv or "-p" in sys.argv:
+            p(Stat.INFO, "[Found flag in arguments]: --print / -p")
             print_games = True
         elif "--no-print" in sys.argv or "-np" in sys.argv:
+            p(Stat.INFO, "[Found flag in arguments]: --no-print / -np")
+
             print_games = False
 
         if "--save" in sys.argv:
+            p(Stat.INFO, "[Found flag in arguments]: --save (will save scraped data to games.json)")
             save_json = True
         
         if "--load" in sys.argv or "-l" in sys.argv:
+            p(Stat.INFO, "[Found flag in arguments]: --load / -l")
             load_data_from_json = True
 
 
@@ -907,6 +937,19 @@ if __name__ == "__main__":
         if save_json:
             try:
                 if ip.confirm("Save results to games.json?", default=True).execute():
+                    # check if a games.json already exists, and if so ask user if they want a comparision
+                    if os.path.exists('games.json'):
+                        try:
+                            with open('games.json', 'r', encoding='utf-8') as f:
+                                existing_games = json.load(f)
+                            if ip.confirm("Do you want to compare the new scraped data with the existing games.json?", default=True).execute():
+                                comp_data = compare_games_lists(existing_games, all_games)
+                                for i in comp_data:
+                                    print(f"New game found: {i} - {comp_data[i]}")
+                        except Exception as e:
+                            p(Stat.ERROR, f"Failed to load existing games.json for comparison: {e}")
+
+
                     with open('games.json', 'w', encoding='utf-8') as f:
                         json.dump(all_games, f, indent=4)
                     p(Stat.SUCCESS, "Saved games.json successfully!")
@@ -979,3 +1022,11 @@ if __name__ == "__main__":
             except Exception as e:
                 p(Stat.ERROR, f"Input error: {e}. Cannot proceed with wishlist comparison.")
         compare_with_wishlist(all_games, wishlist_input if input_wishlist_terminal else None)
+    
+
+    # add option to search for non-steam games for any of the games which were not found on steam
+
+    if ip.confirm("Do you want to scrape for non-steam games?", default=False).execute():
+        non_steam_games = scrapce_con_steam(page_count, env, url=BASE_URL_NON_STEAM, save_to_file=True)
+        for i in non_steam_games:
+            print(f"{str(i):>4} - {non_steam_games[i]}")
