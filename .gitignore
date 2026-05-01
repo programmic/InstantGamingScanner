@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.log
+.gitignore
 chromedriver/
 chrome-win64/
 tmp_html/
@@ -14,3 +15,4 @@ debug_screenshots/
 debug_steam.html
 wishlist.html
 wishlist.txt
+non_steam_games.json

@@ -1,6 +1,12 @@
 from bs4 import BeautifulSoup
 import json
 import re
+import difflib
+try:
+    from fuzzysearch import find_near_matches
+    _HAS_FUZZYSEARCH = True
+except Exception:
+    _HAS_FUZZYSEARCH = False
 
 def get_discount_class(discount):
     try:
@@ -136,30 +142,137 @@ try:
         games_db = json.load(f)
     
     matches = []
+    import unicodedata
+    # helper to detect likely DLC/expansion/add-on based on keywords
+    def likely_dlc(name, info=None):
+        if not name and not info:
+            return False
+        s = (name or '').lower()
+        if isinstance(info, dict):
+            s += ' ' + str(info.get('type', '')).lower()
+        dlc_keywords = ['dlc', 'season pass', 'season-pass', 'expansion', 'expansion pack', 'add-on', 'addon', 'map pack', 'story pack', 'content pack', 'deluxe edition']
+        for kw in dlc_keywords:
+            if kw in s:
+                return True
+        # heuristic: title with colon (subtitle) often indicates DLC/expansion when subtitle is short
+        try:
+            if ':' in name:
+                subtitle = name.split(':', 1)[1].strip()
+                if 0 < len(subtitle.split()) <= 5:
+                    return True
+        except Exception:
+            pass
+        return False
+    def normalize_tokens(name):
+        # unicode normalize
+        s = unicodedata.normalize('NFKD', name)
+        # split camelCase / PascalCase (EldenRing -> Elden Ring)
+        s = re.sub(r'([a-z])([A-Z])', r'\1 \2', s)
+        s = re.sub(r'([A-Z])([A-Z][a-z])', r'\1 \2', s)
+        # replace non-alphanumeric with spaces
+        s = re.sub(r'[^0-9A-Za-z]+', ' ', s)
+        tokens = re.findall(r"\w+", s.lower())
+        # remove common non-informative tokens
+        stopwords = {
+            'edition', 'deluxe', 'ultimate', 'standard', 'bundle', 'vr', 'pc',
+            'europe', 'usa', 'us', 'global', 'steam', 'steam™', 'region'
+        }
+        tokens = [t for t in tokens if t not in stopwords]
+        # normalized forms
+        token_set = set(tokens)
+        compact = ''.join(tokens)
+        spaced = ' '.join(tokens)
+        return token_set, spaced, compact
+
     for db_name, info in games_db.items():
         for wishlist_game in wishlist_games:
-            # Better matching
-            db_words = set(db_name.lower().split())
-            wish_words = set(wishlist_game.lower().split())
-            
-            # 60% word overlap OR exact substring
-            overlap = len(db_words & wish_words) / len(db_words | wish_words)
-            if overlap > 0.6 or db_name.lower() in wishlist_game.lower():
+            # If games.json entries include a display_name (from main.py), prefer that for matching
+            db_display = db_name
+            if isinstance(info, dict) and info.get('display_name'):
+                db_display = info.get('display_name')
+            db_tokens, db_spaced, db_compact = normalize_tokens(db_display)
+            wish_tokens, wish_spaced, wish_compact = normalize_tokens(wishlist_game)
+            if not db_tokens or not wish_tokens:
+                continue
+
+            # token Jaccard overlap
+            common_tokens = db_tokens & wish_tokens
+            union_tokens = db_tokens | wish_tokens
+            overlap = len(common_tokens) / len(union_tokens) if union_tokens else 0.0
+            # sequence similarity as fallback (handles different punctuation/ordering)
+            seq_ratio = difflib.SequenceMatcher(None, db_spaced, wish_spaced).ratio()
+
+            # subset checks (one name contains all meaningful tokens of the other)
+            subset = wish_tokens.issubset(db_tokens) or db_tokens.issubset(wish_tokens)
+            # compact exact match (handles EldenRing vs ELDEN RING)
+            compact_eq = db_compact == wish_compact
+
+            # fuzzysearch approximate substring match when available
+            fuzzy_match = False
+            if _HAS_FUZZYSEARCH:
+                # allow edit distance proportional to length (min 1, max 4)
+                max_len = max(len(db_compact), len(wish_compact))
+                max_l_dist = max(1, min(4, int(max_len * 0.18)))
+                try:
+                    if find_near_matches(wish_spaced, db_spaced, max_l_dist=max_l_dist):
+                        fuzzy_match = True
+                    elif find_near_matches(db_spaced, wish_spaced, max_l_dist=max_l_dist):
+                        fuzzy_match = True
+                except Exception:
+                    fuzzy_match = False
+
+            # Reject obviously tiny database entries
+            if len(db_compact) < 3 or len(wish_compact) < 3:
+                continue
+
+            # Require at least two meaningful token matches for multi-word names
+            min_common_tokens = 2
+
+            score = 0.0
+
+            # Strong exact matches accepted immediately. For subset matches require
+            # at least two meaningful tokens to avoid mapping DLC/subtitles to base game
+            if compact_eq or (subset and min(len(db_tokens), len(wish_tokens)) >= 2):
+                score = 1.0
+            elif len(common_tokens) >= min_common_tokens:
+                # tighten: require higher overlap for multi-word names
+                score = overlap * 0.7 + seq_ratio * 0.3
+            elif len(common_tokens) == 1:
+                # single-token matches are risky — accept only when token is long and sequence similarity is very high
+                token = next(iter(common_tokens))
+                if len(token) >= 6 and seq_ratio > 0.92 and fuzzy_match:
+                    score = 0.85
+                else:
+                    score = 0.0
+            else:
+                # fallback: allow fuzzy substring+very-high-sequence
+                if fuzzy_match and seq_ratio > 0.88:
+                    score = 0.8
+
+            # final acceptance threshold (stricter)
+            if score >= 0.82:
                 matches.append({
                     'wishlist': wishlist_game,
+                    'wishlist_original': wishlist_game,
                     'database': db_name,
+                    'database_original': db_display,
                     'discount': info.get('discount', 0),
                     'price': info.get('price', 'N/A'),
-                    'orig_price': info.get('original_price', 'N/A')
+                    'orig_price': info.get('original_price', 'N/A'),
+                    'platform': info.get('type', 'N/A') if isinstance(info, dict) else 'N/A',
+                    'dlc': likely_dlc(db_display, info),
+                    'score': round(score * 100)
                 })
                 break
     
     print(f"\n🎉 {len(matches)} DEALS FOUND!")
     for match in sorted(matches, key=lambda x: x['discount'] or 0, reverse=True)[:15]:
-        discount_color = get_discount_class(match['discount'])
-        price_color = get_price_class(match['price'])
-        print(f"  {discount_color}{match['discount']}%{get_discount_class(None)}  {match['wishlist'][:40]:<40} "
-              f"→ {price_color}{match['price']}€{get_price_class(None)} (was {match['orig_price']}€)")
+        display_wish = match.get('wishlist_original', match.get('wishlist'))
+        display_db = match.get('database_original', match.get('database'))
+        dlc_tag = '[DLC]' if match.get('dlc') else ''
+        score_str = f"{match.get('score', 0)}%"
+        platform = match.get('platform') or 'N/A'
+        print(f"{display_wish[:48]:<50} - {str(match.get('discount','N/A')):>6}% - {match.get('price','N/A')} - {match.get('orig_price','N/A')} - {platform} - {dlc_tag} - {score_str}")
     
     with open("deals.json", "w") as f:
         json.dump(matches, f, indent=2)

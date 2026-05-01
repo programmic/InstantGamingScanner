@@ -14,12 +14,16 @@ from selenium.webdriver.support.ui import WebDriverWait
 from enum import Enum
 from InquirerPy import inquirer as ip
 import re
+from thefuzz import fuzz
+from logging import getLogger, FileHandler, Formatter, INFO, ERROR
 
 
 global BASE_URL, BASE_URL_NON_STEAM, BASE_DIRECTORY
 BASE_DIRECTORY: str = os.getcwd() + "/tmp_html"  # current working directory for saving HTML files
 BASE_URL = "https://www.instant-gaming.com/en/pc/steam/trending/"
-BASE_URL_NON_STEAM = "https://www.instant-gaming.com/en/pc/games/trending/"
+BASE_URL_NON_STEAM = "https://www.instant-gaming.com/en/pc/trending/"
+# debug flag to print detailed fuzzy-match candidate scores for wishlist items
+MATCH_DEBUG = False
 
 
 # enum list of status indicators for messages
@@ -29,15 +33,27 @@ class Stat(Enum):
     WARNING = 3
     ERROR = 4
 
+def printl(*messages: object, end='\n', sep=' ', flush=True, file=None, log=True) -> None:
+    print(*messages, end=end, sep=sep, flush=flush, file=file)
+    if log:
+        logger = getLogger('logger')
+        if not logger.hasHandlers():
+            os.makedirs('logs', exist_ok=True)
+            handler = FileHandler('logs/log.log', encoding='utf-8')
+            handler.setFormatter(Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            logger.addHandler(handler)
+            logger.setLevel(INFO)
+        logger.info(sep.join(str(msg) for msg in messages))
+
 def p(status: Stat, message: str) -> None:
     if status == Stat.INFO:
-        print(f"\033[34m[?]\033[0m {message}")
+        printl(f"\033[34m[?]\033[0m {message}")
     elif status == Stat.SUCCESS:
-        print(f"\033[32m[*]\033[0m {message}")
+        printl(f"\033[32m[*]\033[0m {message}")
     elif status == Stat.WARNING:
-        print(f"\033[33m[!]\033[0m {message}")
+        printl(f"\033[33m[!]\033[0m {message}")
     elif status == Stat.ERROR:
-        print(f"\033[31m[#]\033[0m {message}")
+        printl(f"\033[31m[#]\033[0m {message}")
 
 def visible_length(s: str) -> int:
     ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
@@ -157,7 +173,7 @@ def get_search_results_with_selenium(url, env=None):
                     try:
                         url = r.url
                         if any(x in url for x in ["api", "search", "hits", "products", "listing"]):
-                            print("🔥 API CANDIDATE:", url)
+                            printl("🔥 API CANDIDATE:", url)
                     except:
                         pass
                 page.on('response', _on_response)
@@ -344,11 +360,13 @@ def print_games_from_search_results(data, nosleep=False):
     
     GTL: int = 45 # Game title length
 
-    print(f"% | €  {'Game Name':<{GTL}} {'Original Price':<11}  {'Price':<8} {'Discount (%)'}")
-    print("-" * 95)
+    printl(f"% | €  {'Game Name':<{GTL}} {'Original Price':<11}  {'Price':<8} {'Discount'} {'type':<20}")
+    printl("-" * 95)
 
     games = {}
 
+
+    print_data = {}
     for game in data.get("hits", []):
         try:
             name = game.get("name", "Unknown")
@@ -356,23 +374,55 @@ def print_games_from_search_results(data, nosleep=False):
             price = game.get("price_eur", "N/A")
             discount = game.get("discount", "N/A")
             discount_color = get_discount_class(discount)
-            price_color = get_price_class(price)
-            discount_price = f"{price.split('.')[0][:3]:>3},{price.split('.')[1][:2]:>2}" if price != "N/A" else "N/A"
-            original_price = f"{original_price.split('.')[0][:3]:>3},{original_price.split('.')[1][:2]:>2}" if original_price != "N/A" else "N/A"
+            if price is not None and price != "N/A":
+                price_color = get_price_class(price)
+                if isinstance(price, (int, float, str)) and str(price) != "N/A":
+                    discount_price = f"{price.split('.')[0][:3]:>3},{price.split('.')[1][:2]:>2}" if price != "N/A" else "N/A"
+                else:
+                    discount_price = "N/A"
+                
+                if isinstance(original_price, str) and original_price != "N/A":
+                    original_price = f"{original_price.split('.')[0][:3]:>3},{original_price.split('.')[1][:2]:>2}" if original_price != "N/A" else "N/A"
+                else: discount_price = "N/A"
+            else:
+                price_color = "\033[0m"
+                discount_price = "N/A"
+            try:
+                type = game.get("type", "N/A")
+            except Exception as e:
+                p(Stat.ERROR, f"Error parsing type for {name}: {e}")
+                type = "N/A"
             if len(name[:GTL]) % 2 == 0:
                 name_str = f"{name[:GTL-2]:<{GTL}}".replace("  ", " .") + "  " # replace double spaces with dot for better visibility of spacing
             else:
                 name_str = f"{name[:GTL-2]:<{GTL}}".replace("  ", ". ") + "  " # replace double spaces with dot for better visibility of spacing
 
-            games[name] = {
+            # use a composite key so multiple entries with the same display name but different
+            # platforms/ids are preserved instead of overwritten
+            key = make_game_key_from_obj(game)
+            games[key] = {
+                "display_name": name,
                 "original_price": original_price,
                 "price": discount_price,
-                "discount": discount
+                "discount": discount,
+                "type": type
             }
-        except Exception: pass
-
-        print(f"{discount_color}%\033[0m | {price_color}€\033[0m  {name_str} {original_price}{' '*6}{discount_price}   {discount:>4}%")
-        if not nosleep: time.sleep(0.02)  # slight delay for better readability
+            print_data[key] = {
+                "discount_color":discount_color,
+                "price_color": price_color,
+                "name_str": name_str,
+                "original_price": original_price,
+                "discount_price": discount_price,
+                "discount": discount,
+                "type": type
+                }
+        except Exception as e:
+            if e != "'NoneType' object has no attribute 'split'":
+                p(Stat.ERROR, f"Error occurred while processing game {name}: {e}")
+    for g in print_data.keys():
+        game = print_data[g]
+        printl(f"{str(game['discount_color'])}%\033[0m | {str(game['price_color'])}€\033[0m  {str(game['name_str'])} {str(game['original_price'])}{' '*6}{str(game['discount_price'])}   {str(game['discount']):>4}% {str(game['type']) if str(game['type']) else 'N/A'}")
+        if not nosleep: time.sleep(0.04)  # slight delay for better readability
 
     return games
 
@@ -445,7 +495,7 @@ def process_site(url: str, process_type: ProcessType, env: dict=None, base_direc
         return None
     return data
 
-def detect_max_pages(env: dict, base_url: str, max_cap: int = 1000) -> int:
+def detect_max_pages(env: dict, base_url: str) -> int:
     """Try multiple strategies to detect the maximum number of pages for a listing.
 
     Strategies (in order):
@@ -561,9 +611,57 @@ def detect_max_pages(env: dict, base_url: str, max_cap: int = 1000) -> int:
             p(Stat.ERROR, f"Error occurred while using Playwright: {e}")
 
     # fallback: return a reasonable cap so caller can proceed (caller may choose to iterate further)
-    return min(max_cap, 500)
+    return 100
 
-def fetch_pages_with_playwright(env: dict, base_url: str, pages: int = 10) -> dict:
+def normalize(text: str) -> str:
+    text = text.lower()
+    
+    # remove region tags and editions
+    text = re.sub(r'(europe|eu|global|steam|deluxe edition|goty edition|edition)', '', text)
+    
+    # remove non-alphanumeric
+    text = re.sub(r'[^a-z0-9 ]', '', text)
+    
+    # collapse spaces
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
+
+
+def make_game_key_from_obj(game: dict) -> str:
+    """Create a stable unique key for a scraped game entry.
+
+    Prefer explicit identifiers if present (id, sku, slug). Otherwise use normalized name
+    combined with type to distinguish platform/edition variants.
+    """
+    # prefer explicit ids if present
+    for key in ('id', 'appid', 'app_id', 'product_id', 'sku', 'slug'):
+        val = game.get(key)
+        if val:
+            try:
+                return f"{key}:{str(val)}"
+            except Exception:
+                pass
+
+    name = game.get('name', '') or ''
+    gtype = game.get('type') or game.get('platform') or ''
+    # create compact normalized composite for name
+    nname = normalize(name)
+    # sanitize type/platform WITHOUT stripping platform keywords like 'steam' — keep tokens
+    if gtype:
+        if isinstance(gtype, (list, tuple)):
+            gtype_str = ' '.join(map(str, gtype))
+        else:
+            gtype_str = str(gtype)
+        ntype = re.sub(r'[^A-Za-z0-9 ]', '', gtype_str).lower().strip()
+        ntype = re.sub(r'\s+', ' ', ntype)
+    else:
+        ntype = ''
+    if ntype:
+        return f"name:{nname}::type:{ntype}"
+    return f"name:{nname}"
+
+def fetch_pages_with_playwright(env: dict, base_url: str, pages: int = 10, nosleep: bool = False) -> dict:
     """Fixed Playwright pagination with proper timeouts, deduplication, and return value"""
     sync_playwright = env.get('sync_playwright')
     if sync_playwright is None:
@@ -645,34 +743,41 @@ def fetch_pages_with_playwright(env: dict, base_url: str, pages: int = 10) -> di
                     # Process each game and deduplicate
                     for game in hits:
                         name = game.get('name', f'Unknown_{i}')
-                        
-                        # Skip if already seen
-                        if name in seen_games:
+
+                        # create a stable unique key for this entry so that variants/platforms
+                        # with the same display name are not overwritten
+                        key = make_game_key_from_obj(game)
+
+                        # Skip if we've already seen this exact entry
+                        if key in seen_games:
                             continue
-                        
-                        seen_games.add(name)
-                        
-                        # Use correct field names from your print_games_from_search_results function
-                        all_games[name] = {
+                        seen_games.add(key)
+
+                        # store under composite key, keep display name for printing
+                        all_games[key] = {
+                            "display_name": name,
                             "original_price": game.get("default_retail", "N/A"),
                             "price": game.get("price_eur", "N/A"),
-                            "discount": game.get("discount", "N/A")
+                            "discount": game.get("discount", "N/A"),
+                            "type": game.get("type", "N/A"),
+                            # keep raw entry for debugging if needed
+                            "_raw": game
                         }
                         new_count += 1
                     
                     if new_count > 0:
                         p(Stat.SUCCESS, f"Page {i}: {len(hits)} total, {new_count} NEW games")
-                        print(f"\n{'='*95}")
-                        print(f"     PAGE {i} - TOP DEALS ({new_count} NEW GAMES)")
-                        print(f"{'='*95}")
-                        print_games_from_search_results(js_data)
+                        printl(f"\n{'='*95}")
+                        printl(f"     PAGE {i} - TOP DEALS ({new_count} NEW GAMES)")
+                        printl(f"{'='*95}")
+                        print_games_from_search_results(js_data, nosleep)
                     else:
                         p(Stat.WARNING, f"Page {i}: No new games (all duplicates)")
                 else:
                     p(Stat.WARNING, f"Page {i}: Empty or invalid searchResults")
                 
-                # Debug screenshot every 3rd page
-                if i % 3 == 0:
+                # Debug screenshot every 5th page
+                if i % 5 == 0:
                     try:
                         page.screenshot(path=f'debug_screenshots/debug_page_{i}.png')
                         p(Stat.INFO, f"Saved debug screenshot: debug_screenshots/debug_page_{i}.png")
@@ -685,12 +790,12 @@ def fetch_pages_with_playwright(env: dict, base_url: str, pages: int = 10) -> di
             page.close()
             
             # Rate limiting and early exit
-            if i > 2 and len(seen_games) == 0:
+            if i > 5 and len(seen_games) == 0:
                 p(Stat.INFO, "No content found in first few pages, stopping early")
                 break
-            if i % 3 == 0:
+            if i % 5 == 0:
                 p(Stat.INFO, "⏸ Rate limiting pause...")
-                time.sleep(1.5)
+                time.sleep(1)
         
         browser.close()
     
@@ -699,51 +804,228 @@ def fetch_pages_with_playwright(env: dict, base_url: str, pages: int = 10) -> di
 
 def compare_with_wishlist(p_all_games: dict, wishlist_input: str = None) -> dict:
     if wishlist_input is not None:
-        wishlist_items = wishlist_input.split(",")
+        try:
+            wishlist_items = []
+            if isinstance(wishlist_input, str):
+                wishlist_items = wishlist_input.split(",")
+            elif isinstance(wishlist_input, list):
+                wishlist_items = wishlist_input
+            else:
+                p(Stat.ERROR, f"Invalid wishlist input type: {platform_type(wishlist_input)}. Expected str or list.")
+        except Exception as e:
+            p(Stat.ERROR, f"Error parsing wishlist input: {e}")
+            wishlist_items = []
     else:
-        with open('wishlist.txt', 'r', encoding='utf-8') as f:
-            wishlist_items = f.read().split(",")
-    print("Wishlist Items detected:", len(wishlist_items))
+        try:
+            with open('wishlist.txt', 'r', encoding='utf-8') as f:
+                wishlist_items = f.read().split(",")
+        except Exception as e:
+            p(Stat.ERROR, f"Error reading wishlist file: {e}")
+            wishlist_items = []
+    printl("Wishlist Items detected:", len(wishlist_items))
 
-    wishlist_corrected = []
+    # keep both original and normalized forms
+    wishlist_pairs = []
     for game_name in wishlist_items:
-        game_name_corrected = ""
-        for letter in game_name:
-            if letter in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:!?.- ":
-                game_name_corrected += letter
-        wishlist_corrected.append(game_name_corrected)
+        orig = game_name.strip()
+        norm = normalize(game_name)
+        if orig:
+            wishlist_pairs.append({'orig': orig, 'norm': norm})
 
-    if wishlist_corrected:
-        print(f"\n{'='*95}")
-        print(f"     YOUR WISHLIST ITEMS")
-        print(f"{'='*95}")
+    if wishlist_pairs:
+        printl(f"\n{'='*95}")
+        printl(f"     YOUR WISHLIST ITEMS")
+        printl(f"{'='*95}")
 
         unfound_games = []
         database_normalized = {}
 
         final_data = {} # stores matched wishlist items with their price/discount info for potential future use (e.g. saving to file, further analysis, etc.)
 
-        for name, info in p_all_games.items():
-            normalized_name = ""
-            for letter in name:
-                if letter in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:!?.- ":
-                    normalized_name += letter
-            database_normalized[normalized_name] = info
+        # Build optional index by normalized display name for quick lookups if needed
+        for key, info in p_all_games.items():
+            display = info.get('display_name') if isinstance(info, dict) else key
+            normalized_name = normalize(display)
+            if normalized_name not in database_normalized:
+                database_normalized[normalized_name] = []
+            database_normalized[normalized_name].append((key, info))
 
-        for item in wishlist_corrected:
-            info = database_normalized.get(item.strip())
-            if not info:
-                unfound_games.append(item.strip())
+        # matching thresholds (tunable)
+        MIN_TOKEN_SET = 80  # lowered to reduce false negatives around ~82-84 set scores
+        MIN_PARTIAL = 75
+        MIN_SORT = 75
+        MIN_OVERALL = 90
+        # minimum overall blended score required when accepting via token_set+other metric
+        MIN_ACCEPT_SCORE = 80
+
+        for pair in wishlist_pairs:
+            item_norm = pair['norm']
+            item_orig = pair['orig']
+            info = None
+            best_score = -1
+            best_info = None
+            best_db_name = None
+            best_scores = (0, 0, 0)
+
+            # iterate over original DB entries to preserve unique candidates
+            for db_key, db_info in p_all_games.items():
+                db_display = db_info.get('display_name') if isinstance(db_info, dict) else db_key
+                db_norm = normalize(db_display)
+                try:
+                    score_set = fuzz.token_set_ratio(item_norm, db_norm)
+                    score_partial = fuzz.partial_ratio(item_norm, db_norm)
+                    score_sort = fuzz.token_sort_ratio(item_norm, db_norm)
+                    score = (score_set * 0.5) + (score_sort * 0.3) + (score_partial * 0.2)
+                except Exception as e:
+                    p(Stat.ERROR, f"Error computing fuzzy score between '{item_norm}' and '{db_norm}': {e}")
+                    score_set = score_partial = score_sort = score = 0
+
+                if score > best_score:
+                    best_score = score
+                    best_info = db_info
+                    best_db_name = db_display
+                    best_scores = (score_set, score_partial, score_sort)
+
+            score_set, score_partial, score_sort = best_scores
+            # compute meaningful token list for the wishlist item early (used by multiple rules)
+            try:
+                item_tokens = [t for t in re.findall(r"\w+", item_norm) if t not in {'the','a','an','of','and'}]
+            except Exception:
+                item_tokens = []
+
+            # prefer exact normalized name matches first (fast path)
+            accept = False
+            try:
+                if item_norm and item_norm in database_normalized:
+                    # choose first exact-normalized candidate (usually exact title)
+                    cand_key, cand_info = database_normalized[item_norm][0]
+                    best_info = cand_info
+                    best_db_name = cand_info.get('display_name') if isinstance(cand_info, dict) else cand_key
+                    best_score = 100
+                    score_set = score_partial = score_sort = 100
+                    accept = True
+                    if MATCH_DEBUG:
+                        p(Stat.INFO, f"Exact normalized match shortcut: '{item_orig}' -> '{best_db_name}'")
+            except Exception:
+                pass
+            # Acceptance rules (ordered):
+            # 1) Subtitle/DLC special-case: if token_set==100 and partial is very high, accept (handles "Base: Subtitle" items).
+            # 2) Very short wishlist items (1-2 tokens) require stricter token_set to avoid one-word false positives.
+            # 3) General rule: token_set >= MIN_TOKEN_SET AND (partial OR sort) >= thresholds AND blended >= MIN_ACCEPT_SCORE.
+            # 4) Always accept if blended overall >= MIN_OVERALL.
+            if not accept:
+                # subtitle/expansion shortcut
+                if score_set == 100 and score_partial >= 90:
+                    accept = True
+
+            if not accept:
+                if len(item_tokens) <= 2:
+                    # require stricter token_set for short items
+                    if score_set >= 90 and (score_partial >= MIN_PARTIAL or score_sort >= MIN_SORT):
+                        accept = True
+                else:
+                    if score_set >= MIN_TOKEN_SET and (score_partial >= MIN_PARTIAL or score_sort >= MIN_SORT) and best_score >= MIN_ACCEPT_SCORE:
+                        accept = True
+
+            # allow very high overall blended score regardless of components
+            if not accept and best_score >= MIN_OVERALL:
+                accept = True
+
+            # Prevent single-token subset-like matches (e.g., DLC/subtitles matching base game)
+            # Compute meaningful token counts and enforce stricter acceptance for short names
+            try:
+                # use the best candidate's normalized form (db_norm from loop is stale)
+                best_db_norm = normalize(best_db_name) if best_db_name else ''
+                stopwords = {'edition', 'deluxe', 'standard', 'ultimate', 'bundle', 'dlc', 'season', 'pass'}
+                item_tokens = [t for t in re.findall(r"\w+", item_norm) if t not in stopwords]
+                db_tokens = [t for t in re.findall(r"\w+", best_db_norm) if t not in stopwords]
+                min_tokens = min(len(item_tokens), len(db_tokens))
+                # If one side has fewer than 2 meaningful tokens, don't accept weak matches
+                if min_tokens < 2 and accept:
+                    # allow only near-exact matches for single-token cases, with an exception:
+                    # accept if the DB name starts with the wishlist token (base title + edition),
+                    # and partial/token-set indicate a strong match (handles 'NieR:Automata' -> 'NieR:Automata Game of The YoRHa Edition').
+                    try:
+                        db_compact = re.sub(r'\s+', '', db_norm)
+                        item_compact = re.sub(r'\s+', '', item_norm)
+                        if item_norm == db_norm or best_score >= 97:
+                            accept = True
+                        elif len(item_tokens) <= 1 and db_compact.startswith(item_compact) and score_partial >= 90 and score_set >= 90:
+                            accept = True
+                        else:
+                            accept = False
+                    except Exception:
+                        accept = False
+            except Exception:
+                pass
+
+            FGNL: int = 42 # Formatting Game Name Length
+
+            # If debug mode enabled, print top candidate scores for this wishlist item
+            try:
+                if MATCH_DEBUG:
+                    candidates = []
+                    for db_key2, db_info2 in p_all_games.items():
+                        db_display2 = db_info2.get('display_name') if isinstance(db_info2, dict) else db_key2
+                        db_norm2 = normalize(db_display2)
+                        try:
+                            s_set = fuzz.token_set_ratio(item_norm, db_norm2)
+                            s_prt = fuzz.partial_ratio(item_norm, db_norm2)
+                            s_srt = fuzz.token_sort_ratio(item_norm, db_norm2)
+                            s_bst = (s_set * 0.5) + (s_srt * 0.3) + (s_prt * 0.2)
+                        except Exception:
+                            s_set = s_prt = s_srt = s_bst = 0
+                        candidates.append((s_bst, s_set, s_prt, s_srt, db_display2))
+                    candidates.sort(reverse=True)
+                    p(Stat.INFO, f"Top candidates for '{item_orig}':")
+                    for c in candidates[:6]:
+                        p(Stat.INFO, f"  {c[4][:60]:<60} -> bst={c[0]:5.1f} set={c[1]:3} prt={c[2]:3} srt={c[3]:3}")
+            except Exception:
+                pass
+
+
+            if accept and best_info is not None:
+                info = best_info
+                p(Stat.SUCCESS, f"Found match: {item_orig[:FGNL]:<{FGNL}} -> {best_db_name[:FGNL]:<{FGNL}} (set={score_set:<3} prt={score_partial:<3} srt={score_sort:<3} bst={best_score:<3}   Discount: {info.get('discount', 'N/A')})")
+               #  p(Stat.INFO, f"{type(item_orig)}, {type(best_db_name)}")
+               # exit()
+            else:
+                p(Stat.WARNING, f"No match:    {item_orig[:FGNL]:<{FGNL}}  > {(best_db_name[:FGNL] if best_db_name else 'N/A'):<{FGNL}} (best={best_score:<3} set={score_set:<3} prt={score_partial:<3} srt={score_sort:<3})")
+                unfound_games.append(item_orig)
                 continue
 
             discount = info.get('discount', 'N/A')
             price = info.get('price', 'N/A')
             original_price = info.get('original_price', 'N/A')
             orig_str = f"{original_price:>6}" if original_price is not None else "\033[90m  N/A \033[0m"
-            # print(f"{str(item)[:48]:<50} - {str(discount):>6}% off -  {str(price):>6}€   ( {orig_str}€ )")
-            final_data[item] = {'discount': discount, 'price': price, 'original_price': original_price.strip() if isinstance(original_price, str) else original_price}
-        p(Stat.INFO, f"Wishlist comparison complete! {len(wishlist_corrected) - len(unfound_games)} items found, {len(unfound_games)} items not found.")
-        
+            platform_type = info.get('type', 'N/A')
+            # detect likely DLC/expansion
+            dlc = False
+            try:
+                dlc_keywords = ['dlc', 'season pass', 'season-pass', 'expansion', 'expansion pack', 'add-on', 'addon', 'map pack', 'story pack', 'content pack', 'deluxe edition']
+                combined = (best_db_name or '').lower() + ' ' + (item_orig or '').lower() + ' ' + str(info.get('type', '')).lower()
+                if any(kw in combined for kw in dlc_keywords):
+                    dlc = True
+                else:
+                    # heuristic: colon + short subtitle often a DLC/expansion
+                    if ':' in item_orig:
+                        subtitle = item_orig.split(':', 1)[1].strip()
+                        if 0 < len(subtitle.split()) <= 5:
+                            dlc = True
+            except Exception:
+                dlc = False
+
+            # store score and dlc flag
+            final_data[item_orig] = {
+                'discount': discount,
+                'price': price,
+                'original_price': original_price.strip() if isinstance(original_price, str) else original_price,
+                'platform_type': platform_type,
+                'dlc': dlc,
+                'score': int(best_score)
+                }
+        p(Stat.INFO, f"Wishlist comparison complete! {len(wishlist_pairs) - len(unfound_games)} items found, {len(unfound_games)} items not found.")
+        printl()
         # print final_data sorted by discount
         sorted_final = sorted(final_data.items(), key=lambda x: x[1]['discount'], reverse=True)
         for idx, x in enumerate(sorted_final):
@@ -753,29 +1035,32 @@ def compare_with_wishlist(p_all_games: dict, wishlist_input: str = None) -> dict
             price = info.get('price', 'N/A')
             original_price = info.get('original_price', 'N/A')
             orig_str = f"{original_price:>5}" if original_price is not None else "\033[90m N/A \033[0m"
+            platform_type = info.get('platform_type', 'N/A')
+            dlc_tag = ' DLC ' if info.get('dlc') else '     '
+            score_str = f"{info.get('score', 0)}%"
             
             # add seperative lines between discount levels for better readability
             if idx > 0 and isinstance(discount, (int, float)) and isinstance(sorted_final[idx-1][1]['discount'], (int, float)):
                 prev_discount = sorted_final[idx-1][1]['discount']
                 # Print separator when crossing into a lower tier (descending order)
-                if   prev_discount >= 100 and discount < 100: print(f"{' '*48}100 - 90\n{'='*95}")
-                elif prev_discount >= 90 and discount < 90: print(f"{' '*48}90 - 75\n{'='*95}")
-                elif prev_discount >= 75 and discount < 75: print(f"{' '*48}75 - 60\n{'='*95}")
-                elif prev_discount >= 60 and discount < 60: print(f"{' '*48}60 - 45\n{'='*95}")
-                elif prev_discount >= 45 and discount < 45: print(f"{' '*48}45 - 20\n{'='*95}")
-                elif prev_discount >= 20 and discount < 20: print(f"{' '*48}20 - 0\n{'='*95}")
+                if   prev_discount >= 100 and discount < 100: printl(f"{' '*48}100 - 90\n{'='*105}")
+                elif prev_discount >=  90 and discount <  90: printl(f"{' '*48 }90 - 75\n{'='*105}")
+                elif prev_discount >=  75 and discount <  75: printl(f"{' '*48 }75 - 60\n{'='*105}")
+                elif prev_discount >=  60 and discount <  60: printl(f"{' '*48 }60 - 45\n{'='*105}")
+                elif prev_discount >=  45 and discount <  45: printl(f"{' '*48 }45 - 20\n{'='*105}")
+                elif prev_discount >=  20 and discount <  20: printl(f"{' '*48 }20 - 0\n{ '='*105}")
 
             price_str = f"{price:>5}€" if str(price) != "1.00" else "\033[95m 1.00€\033[0m"
 
-            print(f"{str(item)[:48]:<50} - {str(discount):>6}% off -  {price_str}   ( {orig_str}€ )   {get_price_class(price)}€\033[0;0m") # add color based on discount level
+            printl(f"{str(item)[:48]:<50}   {str(discount):>6}%   {price_str}   {orig_str} {dlc_tag} {str(score_str):>4}   {', '.join(platform_type) if isinstance(platform_type, list) else (platform_type if platform_type else 'N/A')}")
 
 
         if unfound_games:
-            print(f"\n{'='*95}")
-            print(f"     UNFOUND WISHLIST ITEMS")
-            print(f"{'='*95}")
+            printl(f"\n{'='*105}")
+            printl(f"     UNFOUND WISHLIST ITEMS")
+            printl(f"{'='*105}")
             for item in unfound_games:
-                print(item)
+                printl(item)
         print_price_classes()
     else:
         p(Stat.INFO, "No wishlist items selected.")
@@ -783,13 +1068,21 @@ def compare_with_wishlist(p_all_games: dict, wishlist_input: str = None) -> dict
 def compare_games_lists(games1: dict, games2: dict) -> dict:
     """Compare two game dictionaries and return a dict of games that are in games1 but not in games2, along with their price/discount info from games1."""
     unique_games = {}
-    for name, info in games1.items():
-        if name not in games2:
-            unique_games[name] = info
+    # games keys may be composite (name+type or id), so compare by display_name when necessary
+    games2_display_names = {v.get('display_name') if isinstance(v, dict) else None for v in games2.values()} if isinstance(games2, dict) else set()
+    for key, info in games1.items():
+        if isinstance(info, dict):
+            display = info.get('display_name')
+        else:
+            display = key
+
+        # if exact key missing and display name is present in other set, consider it duplicate
+        if key not in games2 and display not in games2_display_names:
+            unique_games[key] = info
     return unique_games
 
-def scrapce_con_steam(p_page_count, env, url=BASE_URL_NON_STEAM, save_to_file=True) -> dict:
-    non_steam_games = fetch_pages_with_playwright(env, url, pages=p_page_count)
+def scrapce_non_steam(p_page_count, env, url=BASE_URL_NON_STEAM, save_to_file=True, nosleep: bool = False) -> dict:
+    non_steam_games = fetch_pages_with_playwright(env, url, pages=p_page_count, nosleep=nosleep)
     # Save non-steam games to file for inspection
     if save_to_file:
         p(Stat.INFO, f"Fetched {len(non_steam_games)} non-steam games. Saving to file...")
@@ -810,11 +1103,61 @@ def print_price_classes():
 
     spacing = int(visible_length(repres) / 2 - len(title) / 2)
 
-    print(f"\n{' ' * spacing}{title}")
-    print(repres)
+    printl(f"\n{' ' * spacing}{title}")
+    printl(repres)
+
+def eval_page_count(
+        env,
+        page_count: int | None = None,
+        flags: list[ str ] = [],
+        url: str = BASE_URL
+        ) -> int:
+    if "--all" in flags or "-a" in flags:
+        p(Stat.INFO, "[Found flag in arguments]: --all (scrape all pages)")
+        page_count = 0
+    if page_count is None:
+        try:
+            page_count = ip.text("How many pages to scrape?", default="10", validate=lambda x: x.isdigit(), invalid_message="Please enter a integer").execute()
+            page_count = int(page_count)
+        except Exception as e:
+            p(Stat.ERROR, f"Input error: {e}. Defaulting to 10 pages.")
+            page_count = 10
+
+    if page_count > 20:
+        if not ip.confirm(f"You entered {page_count} pages. This may take a long time and could trigger anti-bot measures. Are you sure?", default=False).execute():
+            p(Stat.INFO, "Aborting per user request.")
+            exit(0)
+    elif page_count < 1:
+        if ip.confirm(f"You entered {page_count} pages. Selection of 0 or less pages leads to all pages being scraped, which may take a very long time.\nAre you sure you want to proceed scraping ALL pages?", default=False).execute():
+            p(Stat.INFO, "Proceeding to scrape all pages. This may take a very long time and could trigger anti-bot measures.")
+            # detect max amount of pages automatically
+            try:
+                detected = detect_max_pages(env, url)
+                if detected and isinstance(detected, int) and detected > 0:
+                    page_count = detected
+                    p(Stat.SUCCESS, f"Detected maximum pages: {page_count}")
+                else:
+                    p(Stat.ERROR, "Could not detect max pages, defaulting to 10 pages.")
+                    page_count = 10
+            except Exception as e:
+                p(Stat.ERROR, f"Auto-detection failed: {e}. Defaulting to 10 pages.")
+                page_count = 10
+        
+    return page_count
+
 
 
 if __name__ == "__main__":
+
+    # setup logger
+    logger = getLogger('logger')
+
+    if not logger.hasHandlers():
+        os.makedirs('logs', exist_ok=True)
+        handler = FileHandler('logs/log.log', encoding='utf-8')
+        handler.setFormatter(Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logger.addHandler(handler)
+        logger.setLevel(INFO)
 
     # detect console arguments for quick settings
     compare_with_wishlist_B = None
@@ -822,27 +1165,37 @@ if __name__ == "__main__":
     print_games = False
     save_json = False
     load_data_from_json = False
-
+    scrape_non_steam = None
     input_wishlist_terminal = False
+    b_no_sleep = False
+    skip_confirmation = False
+    clear_log_on_start = True
 
     if len(sys.argv) > 1:
         if "--help" in sys.argv or "-h" in sys.argv:
-            print("Usage: python main.py [options]\n")
-            print("Options:")
-            print("  --wishlist       Compare scraped games with wishlist.txt")
-            print("  --all            Scrape all pages (default is to ask for page count)")
-            print("  --print          Print scraped games to console (default)")
-            print("  --no-print       Do not print scraped games to console")
-            print("  --save           Save scraped data to games.json")
-            print("  --load           Load scraped data from games.json instead of scraping")
+            printl("Usage: python main.py [options]\n")
+            printl("Options:")
+            printl("  --wishlist          / -w   Compare scraped games with wishlist.txt")
+            printl("  --wishlist-terminal / -wt  Compare scraped games with wishlist input directly in terminal (comma-separated)")
+            printl("  --all               / -a   Scrape all pages (default is to ask for page count)")
+            printl("  --print             / -p   Print scraped games to console (default)")
+            printl("  --no-print          / -np  Do not print scraped games to console")
+            printl("  --save              / -s   Save scraped data to games.json")
+            printl("  --load              / -l   Load scraped data from games.json instead of scraping")
+            printl("  --scrape-non-steam  / -sn  Scrape non-steam games from Instant Gaming (experimental)")
+            printl("  --no-non-steam      / -ns  Do not scrape non-steam games")
+            printl("  --nosleep           / --no-sleep  Disable sleep between page requests (not recommended)")
+            printl("  --confirm           / -y   Skip confirmation prompts (use with caution)")
+            printl("  --no-clear-log      / -nc  Do not clear console on start (default is to clear)")
             exit(0)
 
         if "--wishlist" in sys.argv or "-w" in sys.argv:
             p(Stat.INFO, "[Found flag in arguemnts]: --wishlist / -w")
             compare_with_wishlist_B = True
-            if "--wishlist-terminal" in sys.argv or "-wt" in sys.argv:
-                p(Stat.INFO, "[Found flag in arguments]: --wishlist-terminal / -wt")
-                input_wishlist_terminal = True
+        if "--wishlist-terminal" in sys.argv or "-wt" in sys.argv:
+            p(Stat.INFO, "[Found flag in arguments]: --wishlist-terminal / -wt")
+            compare_with_wishlist_B = True
+            input_wishlist_terminal = True
 
         elif "--no-wishlist" in sys.argv or "-nw" in sys.argv:
             p(Stat.INFO, "[Found flag in arguments]: --no-wishlist / -nw")
@@ -860,57 +1213,82 @@ if __name__ == "__main__":
 
             print_games = False
 
-        if "--save" in sys.argv:
+        if "--save" in sys.argv or "-s" in sys.argv:
             p(Stat.INFO, "[Found flag in arguments]: --save (will save scraped data to games.json)")
             save_json = True
         
         if "--load" in sys.argv or "-l" in sys.argv:
             p(Stat.INFO, "[Found flag in arguments]: --load / -l")
             load_data_from_json = True
+        
+        if "--scrape-non-steam" in sys.argv or "-sn" in sys.argv:
+            p(Stat.INFO, "[Found flag in arguments]: --scrape-non-steam (will scrape non-steam games from Instant Gaming)")
+            scrape_non_steam = True
+        elif "--no-non-steam" in sys.argv or "-ns" in sys.argv:
+            p(Stat.INFO, "[Found flag in arguments]: --no-non-steam (will NOT scrape non-steam games from Instant Gaming)")
+            scrape_non_steam = False
+        
+        if "--nosleep" in sys.argv or "--no-sleep" in sys.argv:
+            p(Stat.INFO, "[Found flag in arguments]: --nosleep (will disable sleep between page requests)")
+            b_no_sleep = True
 
+        if "--confirm" in sys.argv or "-y" in sys.argv:
+            p(Stat.INFO, "[Found flag in arguments]: --confirm (will skip confirmation prompts)")
+            skip_confirmation = True
+        if "--debug-match" in sys.argv or "-dm" in sys.argv:
+            p(Stat.INFO, "[Found flag in arguments]: --debug-match (will print top fuzzy candidates for wishlist items)")
+            MATCH_DEBUG = True
+        
+        if "--no-clear-log" in sys.argv or "-nc" in sys.argv:
+            p(Stat.INFO, "[Found flag in arguments]: --no-clear-log / -nc (will NOT clear console on start)")
+            clear_log_on_start = False
+        
+        if "--preset1" in sys.argv or "-p1" in sys.argv:
+            p(Stat.INFO, "[Found flag in arguments]: --preset1 (-l -a -sn --nosleep -y -w)")
+            load_data_from_json = True
+            page_count = 0
+            scrape_non_steam = True
+            b_no_sleep = True
+            skip_confirmation = True
+            compare_with_wishlist_B = True
+
+    if clear_log_on_start:
+        printl("\033c", end="")
+        # find and clear log file if exists
+        log_file = "logs/log.log"
+        if os.path.exists(log_file):
+            try:
+                with open(log_file, 'w', encoding='utf-8') as f:
+                    f.write("")
+                p(Stat.INFO, "Cleared log file on start.")
+            except Exception as e:
+                p(Stat.ERROR, f"Could not clear log file: {e}")
 
     if not load_data_from_json:
-        print("\033c", end="")
+        printl("\033c", end="")
         p(Stat.INFO, "Starting Instant Gaming Scraper...")
         env = init_fetcher()
 
-        # get max amount of pages to scrape from user input (default 10) using inquirerPy, with validation and error handling
-        if page_count is None:
-            try:
-                page_count = ip.text("How many pages to scrape?", default="10", validate=lambda x: x.isdigit(), invalid_message="Please enter a integer").execute()
-                page_count = int(page_count)
-            except Exception as e:
-                p(Stat.ERROR, f"Input error: {e}. Defaulting to 10 pages.")
-                page_count = 10
+        if scrape_non_steam is None:
+            if skip_confirmation:
+                scrape_non_steam = False
+                p(Stat.INFO, "Skipping confirmation prompts, defaulting to NOT scrape non-steam games.")
+            else:
+                scrape_non_steam = ip.confirm("Do you want to scrape non-steam games from Instant Gaming as well? (experimental)", default=False).execute()
+        if scrape_non_steam:
+            p(Stat.INFO, "Scraping non-steam games from Instant Gaming...")
+            chosen_rul = BASE_URL_NON_STEAM
+        else:
+            chosen_rul = BASE_URL
 
-        if page_count > 20:
-            if not ip.confirm(f"You entered {page_count} pages. This may take a long time and could trigger anti-bot measures. Are you sure?", default=False).execute():
-                p(Stat.INFO, "Aborting per user request.")
-                exit(0)
-        elif page_count < 1:
-            if ip.confirm(f"You entered {page_count} pages. Selection of 0 or less pages leads to all pages being scraped, which may take a very long time.\nAre you sure you want to proceed scraping ALL pages?", default=False).execute():
-                p(Stat.INFO, "Proceeding to scrape all pages. This may take a very long time and could trigger anti-bot measures.")
-                # detect max amount of pages automatically
-                try:
-                    detected = detect_max_pages(env, BASE_URL)
-                    if detected and isinstance(detected, int) and detected > 0:
-                        page_count = detected
-                        p(Stat.SUCCESS, f"Detected maximum pages: {page_count}")
-                        if page_count > 500:
-                            p(Stat.WARNING, f"Detected a very large page count ({page_count}). You may prefer to limit this to avoid rate limiting.")
-                    else:
-                        p(Stat.WARNING, "Could not detect max pages, defaulting to 10 pages.")
-                        page_count = 10
-                except Exception as e:
-                    p(Stat.WARNING, f"Auto-detection failed: {e}. Defaulting to 10 pages.")
-                    page_count = 10
-            
-        p(Stat.INFO, f"Will scrape {page_count} pages of results from Instant Gaming.")
+
+        # get max amount of pages to scrape from user input (default 10) using inquirerPy, with validation and error handling
+        page_count = eval_page_count(env, page_count, flags=sys.argv)
         
         
         if env.get('sync_playwright') is not None:
             p(Stat.INFO, f"Using Playwright with FIXED pagination - scraping {page_count} pages")
-            all_games = fetch_pages_with_playwright(env, BASE_URL, pages=page_count)
+            all_games = fetch_pages_with_playwright(env, chosen_rul, pages=page_count, nosleep=b_no_sleep)
         else:
             p(Stat.WARNING, "Playwright not available. Install with: pip install playwright && playwright install chromium")
             p(Stat.INFO, "Falling back to Selenium...")
@@ -918,15 +1296,15 @@ if __name__ == "__main__":
             all_games = {}
             for i in range(1, page_count + 1):
                 p(Stat.INFO, f"Processing page {i}/{page_count} with Selenium")
-                url = f"{BASE_URL}?page={i}"
+                url = f"{chosen_rul}?page={i}"
                 data = get_search_results_with_selenium(url, env=env)
                 
                 if data and data.get('hits'):
                     p(Stat.SUCCESS, f"Page {i}: {len(data['hits'])} games")
-                    print(f"\n{'='*95}")
-                    print(f"     PAGE {i} - TOP DEALS ({len(data['hits'])} GAMES)")
-                    print(f"{'='*95}")
-                    games = print_games_from_search_results(data)
+                    printl(f"\n{'='*95}")
+                    printl(f"     PAGE {i} - TOP DEALS ({len(data['hits'])} GAMES)")
+                    printl(f"{'='*95}")
+                    games = print_games_from_search_results(data, b_no_sleep)
                     all_games.update(games)
                 else:
                     p(Stat.WARNING, f"Page {i} failed/empty - stopping")
@@ -936,16 +1314,25 @@ if __name__ == "__main__":
 
         if save_json:
             try:
-                if ip.confirm("Save results to games.json?", default=True).execute():
+                if skip_confirmation:
+                    conf = True
+                else:
+                    conf = ip.confirm("Save results to games.json?", default=True).execute()
+                if conf:
                     # check if a games.json already exists, and if so ask user if they want a comparision
                     if os.path.exists('games.json'):
                         try:
                             with open('games.json', 'r', encoding='utf-8') as f:
                                 existing_games = json.load(f)
-                            if ip.confirm("Do you want to compare the new scraped data with the existing games.json?", default=True).execute():
+
+                            if skip_confirmation:
+                                conf = True
+                            else:
+                                conf = ip.confirm("Do you want to compare the new scraped data with the existing games.json?", default=True).execute()
+                            if conf:
                                 comp_data = compare_games_lists(existing_games, all_games)
                                 for i in comp_data:
-                                    print(f"New game found: {i} - {comp_data[i]}")
+                                    printl(f"New game found: {i} - {comp_data[i]}")
                         except Exception as e:
                             p(Stat.ERROR, f"Failed to load existing games.json for comparison: {e}")
 
@@ -970,8 +1357,11 @@ if __name__ == "__main__":
     elif print_games == False:
         cnt = False
     elif print_games is None:
-        response = ip.confirm("Print out top games sorted by discount?", default=True).execute()
-        cnt = response
+        if skip_confirmation:
+            conf = True
+        else:
+            conf = ip.confirm("Do you want to print the scraped games to console?", default=True).execute()
+        cnt = conf
     else: raise ValueError("Invalid value for print_games")
 
 
@@ -996,20 +1386,24 @@ if __name__ == "__main__":
                 return 0
 
         sorted_games = sorted(all_games.items(), key=safe_discount_value, reverse=True)
-        print(f"\n{'='*95}")
-        print(f"     TOP GAMES BY DISCOUNT")
-        print(f"{'='*95}")
+        printl(f"\n{'='*95}")
+        printl(f"     TOP GAMES BY DISCOUNT")
+        printl(f"{'='*95}")
         for name, info in sorted_games[:500]:
             discount = info.get('discount', 'N/A')
             price = info.get('price', 'N/A')
             original_price = info.get('original_price', 'N/A')
-            print(f"{name[:48]:<50} - {discount:>6}% off -  {price:>6}€   ( {original_price:>6}€ )")
+            printl(f"{name[:48]:<50} - {discount:>6}% off -  {price:>6}€   ( {original_price:>6}€ )")
         
     cnt = False
     if compare_with_wishlist_B:
         cnt = True
     elif compare_with_wishlist_B is None:
-        cnt = ip.confirm("Do you want to compare with your wishlist items?").execute()
+        if skip_confirmation:
+            conf = True
+        else:
+            conf = ip.confirm("Do you want to compare with your wishlist items?").execute()
+        cnt = conf
     else: p(Stat.INFO, "Skipping wishlist comparison per user settings.")
         
     if cnt:
@@ -1022,11 +1416,3 @@ if __name__ == "__main__":
             except Exception as e:
                 p(Stat.ERROR, f"Input error: {e}. Cannot proceed with wishlist comparison.")
         compare_with_wishlist(all_games, wishlist_input if input_wishlist_terminal else None)
-    
-
-    # add option to search for non-steam games for any of the games which were not found on steam
-
-    if ip.confirm("Do you want to scrape for non-steam games?", default=False).execute():
-        non_steam_games = scrapce_con_steam(page_count, env, url=BASE_URL_NON_STEAM, save_to_file=True)
-        for i in non_steam_games:
-            print(f"{str(i):>4} - {non_steam_games[i]}")
