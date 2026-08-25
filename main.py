@@ -847,7 +847,38 @@ def compare_with_wishlist(p_all_games: dict, wishlist_input: str = None, sort_by
         if sort_by == 'price':
             sorted_final = sorted(final_data.items(), key=safe_price_value)
         else:
-            sorted_final = sorted(final_data.items(), key=lambda x: x[1]['discount'], reverse=True)
+            def safe_discount_value(item):
+                info = item[1] if isinstance(item, tuple) else item
+                d = info.get('discount', 0)
+                try:
+                    if d is None:
+                        return 0
+                    if isinstance(d, (int, float)):
+                        return int(d)
+                    s = str(d).strip()
+                    if s.lower() in ('n/a', ''):
+                        return 0
+                    if s.endswith('%'):
+                        s = s[:-1]
+                    s = s.replace(',', '.')
+                    return int(float(s))
+                except Exception:
+                    return 0
+
+            sorted_final = sorted(final_data.items(), key=safe_discount_value, reverse=True)
+        
+        # Print topmost header
+        if sorted_final:
+            first_discount = sorted_final[0][1].get('discount', 'N/A')
+            if not first_discount is None or first_discount != 'N/A':
+                if isinstance(first_discount, (int, float)):
+                    if first_discount >= 100: printl(f"{' '*48}100 - 90\n{'='*105}")
+                    elif first_discount >= 90: printl(f"{' '*48}90 - 75\n{'='*105}")
+                    elif first_discount >= 75: printl(f"{' '*48}75 - 60\n{'='*105}")
+                    elif first_discount >= 60: printl(f"{' '*48}60 - 45\n{'='*105}")
+                    elif first_discount >= 45: printl(f"{' '*48}45 - 20\n{'='*105}")
+                    elif first_discount >= 20: printl(f"{' '*48}20 - 0\n{'='*105}")
+        
         for idx, x in enumerate(sorted_final):
             item = x[0]
             info = x[1]
@@ -892,13 +923,14 @@ def compare_with_wishlist(p_all_games: dict, wishlist_input: str = None, sort_by
 
             wishlist_name = str(item)[:48]
             matched_name = str(display_name)[:48]
+            discount_display = discount if discount is not None else 'N/A'
 
             # print table
             line = (
                 f"{wishlist_name:<50} "
                 f"- {score_color}{score_str:>4}\033[0m ->  "
                 f"{matched_name:<50} | "
-                f"{discount:>6}% "
+                f"{str(discount_display):>6}% "
                 f'{" "*5}'
                 f"\033[90m{orig_str}\033[0m  ->  "
                 f"{price_str} "
@@ -1059,7 +1091,7 @@ if __name__ == "__main__":
             printl("  --preset1           / -p1   Load data from JSON, scrape all pages, include non-steam games, no sleep between requests, skip confirmations, compare with wishlist (for quick testing)")
             printl("  --preset2           / -p2   Scrape all data, include non-steam games, no sleep between requests, skip confirmations, compare with wishlist")
             print("\n")
-            exit(0)
+            exit("Exiting after displaying help.")
 
         if "--wishlist" in sys.argv or "-w" in sys.argv:
             p(Stat.INFO, "[Found flag in arguemnts]: --wishlist / -w")
@@ -1185,7 +1217,7 @@ if __name__ == "__main__":
             bool_compare_with_wishlist = True
 
     if clear_log_on_start:
-        printl("\033c", end="")
+        # printl("\033c", end="")
         # find and clear log file if exists
         log_file = "logs/log.log"
         if os.path.exists(log_file):
